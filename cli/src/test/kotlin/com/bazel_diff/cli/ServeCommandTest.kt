@@ -128,6 +128,57 @@ class ServeCommandTest : KoinTest {
     }
   }
 
+  /** Lays out `<temp>/runfiles/<installDir>/bin/git` and returns the runfiles dir path. */
+  private fun runfilesWithBundledGit(installDir: String): String {
+    val runfilesDir = temp.newFolder("runfiles")
+    val gitBin = runfilesDir.toPath().resolve(installDir).resolve("bin").resolve("git")
+    java.nio.file.Files.createDirectories(gitBin.parent)
+    java.nio.file.Files.createFile(gitBin)
+    gitBin.toFile().setExecutable(true)
+    return runfilesDir.path
+  }
+
+  @Test
+  fun resolveGitPathPrefersExplicitFlag() {
+    val runfilesDir = runfilesWithBundledGit("tools/git/git")
+    val resolved =
+        ServeCommand()
+            .apply { gitPath = "/custom/git" }
+            .resolveGitPath(hermeticGitInstallDir = "tools/git/git", runfilesDir = runfilesDir)
+    assertThat(resolved).isEqualTo("/custom/git")
+  }
+
+  @Test
+  fun resolveGitPathUsesInjectedHermeticGitWhenPresent() {
+    val runfilesDir = runfilesWithBundledGit("_main/tools/git/git")
+    val resolved =
+        ServeCommand()
+            .resolveGitPath(hermeticGitInstallDir = "_main/tools/git/git", runfilesDir = runfilesDir)
+    assertThat(resolved)
+        .isEqualTo(
+            java.nio.file.Paths.get(runfilesDir, "_main/tools/git/git", "bin", "git").toString())
+  }
+
+  @Test
+  fun resolveGitPathFallsBackWhenInjectedGitIsAbsentFromRunfiles() {
+    // Property stamped in but the tree is not actually there (or not executable): never break the
+    // deployment, use the PATH git.
+    val resolved =
+        ServeCommand()
+            .resolveGitPath(
+                hermeticGitInstallDir = "_main/tools/git/git",
+                runfilesDir = temp.newFolder("empty-runfiles").path)
+    assertThat(resolved).isEqualTo("git")
+  }
+
+  @Test
+  fun resolveGitPathFallsBackWithoutInjectionOrRunfiles() {
+    // The released JAR / plain //cli:bazel-diff case: no property, no runfiles dir.
+    assertThat(ServeCommand().resolveGitPath(null, null)).isEqualTo("git")
+    // Property present but launched outside a runfiles tree.
+    assertThat(ServeCommand().resolveGitPath("_main/tools/git/git", null)).isEqualTo("git")
+  }
+
   @Test
   fun configFingerprintIsDeterministicAndShort() {
     val a = ServeCommand().computeConfigFingerprint()

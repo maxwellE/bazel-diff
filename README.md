@@ -131,7 +131,11 @@ for each, and reuses the exact same affectedness logic as `get-impacted-targets`
 
 The service needs a `git` binary (see the notes below). When running from this repository you can
 instead let Bazel build git hermetically from a pinned source release (via bzlmod and
-`rules_foreign_cc`) and launch the service with it, removing the host-git dependency entirely:
+`rules_foreign_cc`) and inject it into the tool itself, removing the host-git dependency entirely:
+`//tools/git:bazel-diff-hermetic-git` is the same bazel-diff binary with the hermetic git riding in
+its runfiles, and serve resolves it automatically — an explicit `--gitPath` always wins, and the
+plain binary/released JAR fall back to `git` on the `PATH` as before. Launch it directly, or via
+the convenience wrapper:
 
 ```bash
 bazel run //tools/git:serve -- \
@@ -140,11 +144,11 @@ bazel run //tools/git:serve -- \
   --port 8080
 ```
 
-This wrapper passes `--gitPath` pointing at the Bazel-built git (an explicit `--gitPath` argument
-still wins). The hermetic git is built without libcurl, so it supports local, `ssh://` and `git://`
-remotes but not `http(s)://` ones — point the workspace clone's origin at an SSH remote, or keep
-using a system git via `--gitPath` for https. Linux and macOS only; see `tools/git/BUILD` for
-details and `//tools/git:git_smoke_test` for the serve-shaped operations it is tested against.
+The hermetic git is built without libcurl, so it supports local, `ssh://` and `git://` remotes but
+not `http(s)://` ones — point the workspace clone's origin at an SSH remote, or pass a system git
+via `--gitPath` for https. Linux and macOS only; see `tools/git/BUILD` for details,
+`//tools/git:git_smoke_test` for the serve-shaped git operations the binary is tested against, and
+`//tools/git:serve_injection_test` for the end-to-end proof that serve uses the injected git.
 
 Endpoints:
 
@@ -239,11 +243,11 @@ Notes and current limitations:
 * The service checks out revisions inside `--workspacePath`, so point it at a dedicated clone, not a
   working tree you edit. All workspace-mutating work (git checkout + `bazel query`) is serialized,
   so a single instance answers one cold query at a time; the per-SHA cache absorbs the rest.
-* Git operations (fetch and checkout) shell out to the `git` binary at `--gitPath` (default `git`
-  on the `PATH`), so a `git` binary must be available on the host -- or use
-  `bazel run //tools/git:serve`, which supplies a hermetically built git (see above). The working
-  tree is checked out on disk for `bazel query` to read. Because native git performs every fetch,
-  all clone shapes are supported -- including shallow (`--depth`) and partial
+* Git operations (fetch and checkout) shell out to a `git` binary, so one must be available: an
+  explicit `--gitPath`, a hermetic git injected into the binary's runfiles (the
+  `//tools/git:bazel-diff-hermetic-git` binary, see above), or `git` on the `PATH`, in that order.
+  The working tree is checked out on disk for `bazel query` to read. Because native git performs
+  every fetch, all clone shapes are supported -- including shallow (`--depth`) and partial
   (`--filter=blob:none`) clones, whose thin packs are delta-compressed against objects the clone
   does not have.
 * Hashes are cached on local disk via `--cacheDir` and survive restarts. Left unbounded the cache
@@ -600,7 +604,9 @@ targets between two git revisions, caching generated hashes per commit SHA.
                               external repos. Mutually exclusive with
                               --fineGrainedHashExternalRepos.
       --gitPath=<gitPath>   Path to the git binary used for fetch/checkout
-                              operations. Defaults to 'git' on the PATH.
+                              operations. When unset, a hermetic git bundled in
+                              the binary's runfiles is used if present (see
+                              //tools/git), falling back to 'git' on the PATH.
   -h, --help                Show this help message and exit.
       --ignoredRuleHashingAttributes=<ignoredRuleHashingAttributes>
                             Attributes that should be ignored when hashing rule

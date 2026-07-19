@@ -17,6 +17,7 @@
 # up in MODULE.bazel, not in the legacy WORKSPACE setup.
 
 load("@rules_foreign_cc//foreign_cc:defs.bzl", "configure_make", "make")
+load("@rules_java//java:defs.bzl", "java_binary")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
@@ -95,20 +96,29 @@ filegroup(
     visibility = ["//visibility:public"],
 )
 
-# Runs `bazel-diff serve` with --gitPath pointing at the hermetic git, e.g.:
+# bazel-diff with the hermetic git injected into the tool itself: the git
+# install tree rides in the binary's runfiles, and its runfiles-relative path
+# is stamped into a system property that ServeCommand.resolveGitPath reads at
+# startup. An explicit --gitPath still wins, and the plain //cli:bazel-diff and
+# the released JAR are unaffected (no property -> `git` on the PATH).
+java_binary(
+    name = "bazel-diff-hermetic-git",
+    data = [":git_install_dir"],
+    jvm_flags = [
+        "-Dbazel_diff.hermetic_git_install_dir=$(rlocationpath :git_install_dir)",
+    ],
+    main_class = "com.bazel_diff.Main",
+    visibility = ["//visibility:public"],
+    runtime_deps = ["//cli:cli-lib"],
+)
+
+# Convenience launcher for the query service with the injected git, e.g.:
 #   bazel run //tools/git:serve -- -w /path/to/clone --cacheDir /path/to/cache
-# An explicit --gitPath in the caller's arguments wins over the hermetic one.
 sh_binary(
     name = "serve",
     srcs = ["serve_hermetic.sh"],
-    args = [
-        "$(rlocationpath :git_install_dir)",
-        "$(rlocationpath //cli:bazel-diff)",
-    ],
-    data = [
-        ":git_install_dir",
-        "//cli:bazel-diff",
-    ],
+    args = ["$(rlocationpath :bazel-diff-hermetic-git)"],
+    data = [":bazel-diff-hermetic-git"],
     visibility = ["//visibility:public"],
     deps = ["@bazel_tools//tools/bash/runfiles"],
 )
@@ -122,5 +132,24 @@ sh_test(
     srcs = ["git_smoke_test.sh"],
     args = ["$(rlocationpath :git_install_dir)"],
     data = [":git_install_dir"],
+    deps = ["@bazel_tools//tools/bash/runfiles"],
+)
+
+# End-to-end proof of the injection: starts :bazel-diff-hermetic-git serve
+# against a local clone with a poisoned `git` on the PATH, so the startup
+# `git fetch` (and therefore readiness) can only succeed if the server used the
+# injected hermetic git. Passes once /health returns 200.
+sh_test(
+    name = "serve_injection_test",
+    size = "medium",
+    srcs = ["serve_injection_test.sh"],
+    args = [
+        "$(rlocationpath :bazel-diff-hermetic-git)",
+        "$(rlocationpath :git_install_dir)",
+    ],
+    data = [
+        ":bazel-diff-hermetic-git",
+        ":git_install_dir",
+    ],
     deps = ["@bazel_tools//tools/bash/runfiles"],
 )

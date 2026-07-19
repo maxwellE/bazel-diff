@@ -205,19 +205,23 @@ jobs:
       - name: Setup Bazelisk
         run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v4
-      # Builds git from a pinned source release via bzlmod + rules_foreign_cc and
-      # runs the smoke test covering the exact git operations serve performs
-      # (clone, fetch --all --prune, targeted fetch by SHA, rev-parse --verify,
-      # checkout --force). Then builds the `bazel run //tools/git:serve` wrapper
-      # so its runfiles wiring cannot rot.
-      - name: Run hermetic git smoke test
+      # Builds git from a pinned source release via bzlmod + rules_foreign_cc,
+      # plus the bazel-diff binary that injects it (//tools/git:
+      # bazel-diff-hermetic-git) and the serve wrapper, so their wiring cannot
+      # rot.
+      - name: Build hermetic git targets
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
-        run: ~/go/bin/bazelisk test //tools/git:git_smoke_test --enable_bzlmod=true --enable_workspace=false --test_output=errors
-      - name: Build hermetic serve wrapper
+        run: ~/go/bin/bazelisk build //tools/git/... --enable_bzlmod=true --enable_workspace=false
+      # git_smoke_test covers the exact git operations serve performs (clone,
+      # fetch --all --prune, targeted fetch by SHA, rev-parse --verify,
+      # checkout --force); serve_injection_test boots the injected binary's
+      # serve mode with a poisoned PATH git and asserts /health goes ready,
+      # proving serve used the injected hermetic git.
+      - name: Run hermetic git tests
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
-        run: ~/go/bin/bazelisk build //tools/git:serve --enable_bzlmod=true --enable_workspace=false
+        run: ~/go/bin/bazelisk test //tools/git/... --enable_bzlmod=true --enable_workspace=false --test_output=errors
   deploy:
     needs: [test-jre21]
     runs-on: ubuntu-latest

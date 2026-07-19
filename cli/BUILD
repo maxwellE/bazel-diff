@@ -30,6 +30,10 @@ kt_jvm_library(
     name = "cli-lib",
     srcs = glob(["src/main/kotlin/**/*.kt"]),
     resources = [":version_file"],
+    # //tools/git:bazel-diff-hermetic-git re-wraps this library into a binary
+    # with a hermetic git injected into its runfiles. Kept out of //cli so that
+    # //cli/... never has to build git from source.
+    visibility = ["//tools/git:__pkg__"],
     deps = [
         "//proto:analysis_v2_java_proto",
         "//proto:build_java_proto",

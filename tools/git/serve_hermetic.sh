@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
-# Launches bazel-diff's serve mode with the hermetic git built by
-# //tools/git:git, so the query service does not depend on a system git:
+# Launches the query service via //tools/git:bazel-diff-hermetic-git, the
+# bazel-diff binary with the hermetic git injected into its runfiles:
 #
 #   bazel run //tools/git:serve -- -w /path/to/clone --cacheDir /path/to/cache
 #
-# The first two arguments are runfiles paths injected by the BUILD file (the
-# git install tree and the bazel-diff launcher); everything after them is
-# forwarded to `bazel-diff serve`. If the caller passes an explicit --gitPath,
-# it wins: the hermetic default is then omitted so picocli does not reject the
-# option as set twice.
+# The first argument is the runfiles path of that binary, injected by the BUILD
+# file; everything after it is forwarded to `bazel-diff serve`. Git resolution
+# happens inside the tool (ServeCommand.resolveGitPath): an explicit --gitPath
+# in the forwarded arguments wins over the injected hermetic git.
 
 # --- begin runfiles.bash initialization v3 ---
 set -uo pipefail; set +e; f=bazel_tools/tools/bash/runfiles/runfiles.bash
@@ -21,21 +20,7 @@ source "${RUNFILES_DIR:-/dev/null}/$f" 2>/dev/null || \
   { echo>&2 "ERROR: cannot find $f"; exit 1; }; f=; set -e
 # --- end runfiles.bash initialization v3 ---
 
-git_install_dir="$(rlocation "$1")"
-bazel_diff="$(rlocation "$2")"
-shift 2
+bazel_diff="$(rlocation "$1")"
+shift
 
-git_bin="$git_install_dir/bin/git"
-if [[ ! -x "$git_bin" ]]; then
-  echo >&2 "ERROR: hermetic git not found at $git_bin"
-  exit 1
-fi
-
-for arg in "$@"; do
-  case "$arg" in
-    --gitPath|--gitPath=*)
-      exec "$bazel_diff" serve "$@"
-      ;;
-  esac
-done
-exec "$bazel_diff" serve "--gitPath=$git_bin" "$@"
+exec "$bazel_diff" serve "$@"

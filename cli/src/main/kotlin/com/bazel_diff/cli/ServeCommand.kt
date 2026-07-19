@@ -23,7 +23,9 @@ import com.bazel_diff.server.MetricsService
 import com.bazel_diff.server.ProcessGitClient
 import com.bazel_diff.server.PrunableHashCacheStorage
 import java.io.File
+import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.Paths
 import java.time.Duration
 import java.util.concurrent.Callable
 import java.util.concurrent.CountDownLatch
@@ -74,9 +76,10 @@ class ServeCommand : Callable<Int> {
       names = ["--gitPath"],
       description =
           [
-              "Path to the git binary used for fetch/checkout operations. Defaults to 'git' on the PATH."],
-      defaultValue = "git")
-  var gitPath: String = "git"
+              "Path to the git binary used for fetch/checkout operations. When unset, a hermetic " +
+                  "git bundled in the binary's runfiles is used if present (see //tools/git), " +
+                  "falling back to 'git' on the PATH."])
+  var gitPath: String? = null
 
   @CommandLine.Option(
       names = ["--port"],
@@ -293,10 +296,48 @@ class ServeCommand : Callable<Int> {
   }
 
   /**
-   * Builds the [GitClient]. Git fetch/checkout operations shell out to the `git` binary at
-   * [gitPath], so a `git` binary must be available on the host.
+   * Builds the [GitClient]. Git fetch/checkout operations shell out to the `git` binary resolved
+   * by [resolveGitPath].
    */
-  fun createGitClient(): GitClient = ProcessGitClient(workspacePath, gitPath)
+  fun createGitClient(): GitClient = ProcessGitClient(workspacePath, resolveGitPath())
+
+  /**
+   * Resolves the git binary serve shells out to, in order of preference:
+   * 1. An explicit `--gitPath`.
+   * 2. A hermetic git injected into the binary's runfiles (built from source via bzlmod; see
+   *    //tools/git). The injecting target ([HERMETIC_GIT_PROPERTY] docs) stamps the
+   *    runfiles-relative path of the git install tree into a system property via jvm_flags, which
+   *    is resolved here against the runfiles directory the Bazel launcher exports. Skipped -- so
+   *    injection can never break a deployment that meant to use the host git -- when the property
+   *    is unset (plain //cli:bazel-diff or the released JAR), no runfiles directory is exported,
+   *    or the binary is not actually present and executable there.
+   * 3. `git` on the `PATH`.
+   *
+   * The lookups are parameterized (defaulting to the real system property/environment) so tests
+   * can exercise every branch hermetically.
+   */
+  fun resolveGitPath(
+      hermeticGitInstallDir: String? = System.getProperty(HERMETIC_GIT_PROPERTY),
+      runfilesDir: String? = System.getenv("RUNFILES_DIR") ?: System.getenv("JAVA_RUNFILES"),
+  ): String {
+    gitPath?.let {
+      return it
+    }
+    if (hermeticGitInstallDir != null && runfilesDir != null) {
+      val candidate = Paths.get(runfilesDir, hermeticGitInstallDir, "bin", "git")
+      if (Files.isExecutable(candidate)) return candidate.toString()
+    }
+    return "git"
+  }
+
+  companion object {
+    /**
+     * System property carrying the runfiles-relative path of a bundled hermetic git install tree,
+     * set via jvm_flags by //tools/git:bazel-diff-hermetic-git (`-D<property>=$(rlocationpath
+     * //tools/git:git_install_dir)`). Absent everywhere else, which disables injection.
+     */
+    const val HERMETIC_GIT_PROPERTY = "bazel_diff.hermetic_git_install_dir"
+  }
 
   /**
    * Wires the services, starts the HTTP server, and performs the initial git fetch + readiness
