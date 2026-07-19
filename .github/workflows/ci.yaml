@@ -190,6 +190,34 @@ jobs:
           $prevRev = git rev-parse HEAD~1
           $currRev = git rev-parse HEAD
           .\bazel-diff-example.ps1 -WorkspacePath "$env:GITHUB_WORKSPACE" -BazelPath "$env:USERPROFILE\go\bin\bazelisk.exe" -PreviousRevision $prevRev -FinalRevision $currRev
+  test-hermetic-git:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        bazel: ['8.x', '9.x']
+    steps:
+      - name: Setup Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: ^1.17
+        id: go
+      - name: Setup Bazelisk
+        run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
+      - uses: actions/checkout@v4
+      # Builds git from a pinned source release via bzlmod + rules_foreign_cc and
+      # runs the smoke test covering the exact git operations serve performs
+      # (clone, fetch --all --prune, targeted fetch by SHA, rev-parse --verify,
+      # checkout --force). Then builds the `bazel run //tools/git:serve` wrapper
+      # so its runfiles wiring cannot rot.
+      - name: Run hermetic git smoke test
+        env:
+          USE_BAZEL_VERSION: ${{ matrix.bazel }}
+        run: ~/go/bin/bazelisk test //tools/git:git_smoke_test --enable_bzlmod=true --enable_workspace=false --test_output=errors
+      - name: Build hermetic serve wrapper
+        env:
+          USE_BAZEL_VERSION: ${{ matrix.bazel }}
+        run: ~/go/bin/bazelisk build //tools/git:serve --enable_bzlmod=true --enable_workspace=false
   deploy:
     needs: [test-jre21]
     runs-on: ubuntu-latest

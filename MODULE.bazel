@@ -28,8 +28,9 @@ bazel_dep(name = "grpc", version = "1.76.0", repo_name = "com_github_grpc_grpc")
 
 # Override transitive dependencies to Bazel 9 compatible versions.
 # Marked dev_dependency: these are only needed when building bazel-diff itself
-# (as the root module). rules_nodejs and rules_foreign_cc are not referenced by
-# any bazel-diff target, and rules_python is supplied transitively (proto codegen)
+# (as the root module). rules_nodejs is not referenced by any bazel-diff target,
+# rules_foreign_cc is referenced only by the dev-only hermetic git build under
+# //tools/git, and rules_python is supplied transitively (proto codegen)
 # regardless, so consumers resolve their own versions via MVS.
 bazel_dep(name = "rules_nodejs", version = "6.7.3", dev_dependency = True)
 bazel_dep(name = "rules_foreign_cc", version = "0.15.1", dev_dependency = True)
@@ -69,5 +70,14 @@ use_repo(
 
 non_module_repositories = use_extension("//:extensions.bzl", "non_module_repositories", dev_dependency = True)
 use_repo(non_module_repositories, "ktfmt")
+
+# Hermetic git for the serve capability: //tools/git builds git from source with
+# rules_foreign_cc so `bazel run //tools/git:serve` runs the query service
+# without depending on a system git (see tools/git/BUILD). Dev-only: consumers
+# of bazel-diff as a module do not inherit any of this.
+bazel_dep(name = "rules_shell", version = "0.6.1", dev_dependency = True)
+
+hermetic_git = use_extension("//:extensions.bzl", "hermetic_git", dev_dependency = True)
+use_repo(hermetic_git, "git_source", "zlib_source")
 
 register_toolchains("//:kotlin_toolchain")

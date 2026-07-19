@@ -129,6 +129,23 @@ On startup the service performs an initial `git fetch` and only then reports hea
 request it resolves the `from`/`to` revisions, generates (and caches, keyed by commit SHA) the hashes
 for each, and reuses the exact same affectedness logic as `get-impacted-targets`.
 
+The service needs a `git` binary (see the notes below). When running from this repository you can
+instead let Bazel build git hermetically from a pinned source release (via bzlmod and
+`rules_foreign_cc`) and launch the service with it, removing the host-git dependency entirely:
+
+```bash
+bazel run //tools/git:serve -- \
+  --workspacePath /path/to/workspace-clone \
+  --cacheDir /var/cache/bazel-diff \
+  --port 8080
+```
+
+This wrapper passes `--gitPath` pointing at the Bazel-built git (an explicit `--gitPath` argument
+still wins). The hermetic git is built without libcurl, so it supports local, `ssh://` and `git://`
+remotes but not `http(s)://` ones — point the workspace clone's origin at an SSH remote, or keep
+using a system git via `--gitPath` for https. Linux and macOS only; see `tools/git/BUILD` for
+details and `//tools/git:git_smoke_test` for the serve-shaped operations it is tested against.
+
 Endpoints:
 
 * `GET /health` — returns `200 OK` once the initial fetch has completed, `503` otherwise. A load
@@ -223,10 +240,12 @@ Notes and current limitations:
   working tree you edit. All workspace-mutating work (git checkout + `bazel query`) is serialized,
   so a single instance answers one cold query at a time; the per-SHA cache absorbs the rest.
 * Git operations (fetch and checkout) shell out to the `git` binary at `--gitPath` (default `git`
-  on the `PATH`), so a `git` binary must be available on the host. The working tree is checked out
-  on disk for `bazel query` to read. Because native git performs every fetch, all clone shapes are
-  supported -- including shallow (`--depth`) and partial (`--filter=blob:none`) clones, whose thin
-  packs are delta-compressed against objects the clone does not have.
+  on the `PATH`), so a `git` binary must be available on the host -- or use
+  `bazel run //tools/git:serve`, which supplies a hermetically built git (see above). The working
+  tree is checked out on disk for `bazel query` to read. Because native git performs every fetch,
+  all clone shapes are supported -- including shallow (`--depth`) and partial
+  (`--filter=blob:none`) clones, whose thin packs are delta-compressed against objects the clone
+  does not have.
 * Hashes are cached on local disk via `--cacheDir` and survive restarts. Left unbounded the cache
   grows by one entry per distinct commit SHA queried, so a long-running server can bound it with any
   combination of `--cacheMaxAge` (expire entries not read or written within a window, e.g. `7d`),
