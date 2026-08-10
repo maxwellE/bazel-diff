@@ -2,9 +2,12 @@ package com.bazel_diff.hash
 
 import com.bazel_diff.bazel.BazelSourceFileTarget
 import java.nio.file.Path
+import java.util.concurrent.atomic.AtomicInteger
 
 class FakeSourceFileHasher : SourceFileHasher {
   var fakeDigests: MutableMap<String, ByteArray> = mutableMapOf()
+  var softDigestValue: ByteArray? = "fake-soft-digest".toByteArray()
+  val softDigestCalls = AtomicInteger()
 
   override fun digest(
       sourceFileTarget: BazelSourceFileTarget,
@@ -18,7 +21,13 @@ class FakeSourceFileHasher : SourceFileHasher {
       sourceFileTarget: BazelSourceFileTarget,
       modifiedFilepaths: Set<Path>
   ): ByteArray? {
-    return "fake-soft-digest".toByteArray()
+    softDigestCalls.incrementAndGet()
+    // Mirror SourceFileHasherImpl: external-repo labels never contribute a soft digest.
+    if (sourceFileTarget.name.startsWith("@") && !sourceFileTarget.name.startsWith("@//") &&
+        !sourceFileTarget.name.startsWith("@@//")) {
+      return null
+    }
+    return softDigestValue
   }
 
   fun add(name: String, digest: ByteArray) {

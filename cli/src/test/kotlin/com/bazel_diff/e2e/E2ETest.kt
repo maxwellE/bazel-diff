@@ -1,6 +1,7 @@
 package com.bazel_diff.e2e
 
 import assertk.assertThat
+import assertk.assertions.contains
 import assertk.assertions.isEqualTo
 import com.bazel_diff.cli.BazelDiff
 import com.google.gson.Gson
@@ -166,26 +167,16 @@ class E2ETest {
   @Test
   fun testServeEndToEnd() {
     val workspace = copyTestWorkspace("distance_metrics")
-    fun git(vararg args: String): String {
-      val proc =
-          ProcessBuilder(listOf("git") + args)
-              .directory(workspace)
-              .redirectErrorStream(true)
-              .start()
-      val output = proc.inputStream.readBytes().decodeToString()
-      check(proc.waitFor() == 0) { "git ${args.joinToString(" ")} failed: $output" }
-      return output.trim()
-    }
-    git("init", "-q")
-    git("config", "user.email", "test@example.com")
-    git("config", "user.name", "test")
-    git("add", "-A")
-    git("commit", "-q", "-m", "base")
-    val fromSha = git("rev-parse", "HEAD")
+    git(workspace, "init", "-q")
+    git(workspace, "config", "user.email", "test@example.com")
+    git(workspace, "config", "user.name", "test")
+    git(workspace, "add", "-A")
+    git(workspace, "commit", "-q", "-m", "base")
+    val fromSha = git(workspace, "rev-parse", "HEAD")
     File(workspace, "lib.sh").writeText("echo changed\n")
-    git("add", "-A")
-    git("commit", "-q", "-m", "change lib.sh")
-    val toSha = git("rev-parse", "HEAD")
+    git(workspace, "add", "-A")
+    git(workspace, "commit", "-q", "-m", "change lib.sh")
+    val toSha = git(workspace, "rev-parse", "HEAD")
 
     val cacheDir = temp.newFolder()
     val port = java.net.ServerSocket(0).use { it.localPort }
@@ -245,6 +236,66 @@ class E2ETest {
       serveThread.interrupt()
       serveThread.join(10_000)
     }
+  }
+
+  @Test
+  fun testServeDoesNotReuseMacroDigestAcrossRevisions() {
+    val workspace = copyTestWorkspace("serve_bzl_cache")
+    git(workspace, "init", "-q")
+    git(workspace, "config", "user.email", "test@example.com")
+    git(workspace, "config", "user.name", "test")
+    git(workspace, "add", "-A")
+    git(workspace, "commit", "-q", "-m", "base")
+    val fromSha = git(workspace, "rev-parse", "HEAD")
+
+    File(workspace, "defs.bzl").appendText("\n# second revision\n")
+    git(workspace, "add", "-A")
+    git(workspace, "commit", "-q", "-m", "change macro source")
+    val toSha = git(workspace, "rev-parse", "HEAD")
+
+    val cacheDir = temp.newFolder()
+    val port = java.net.ServerSocket(0).use { it.localPort }
+    val serveThread =
+        Thread {
+              CommandLine(BazelDiff())
+                  .execute(
+                      "serve",
+                      "-w",
+                      workspace.absolutePath,
+                      "-b",
+                      "bazel",
+                      "--cacheDir",
+                      cacheDir.absolutePath,
+                      "--port",
+                      port.toString(),
+                      "--no-initial-fetch")
+            }
+            .apply {
+              isDaemon = true
+              start()
+            }
+
+    try {
+      awaitServeHealthy(port)
+      val (code, body) =
+          httpGetServe("http://localhost:$port/impacted_targets?from=$fromSha&to=$toSha")
+      assertThat(code).isEqualTo(200)
+      val parsed: Map<String, Any> =
+          Gson().fromJson(body, object : TypeToken<Map<String, Any>>() {}.type)
+      @Suppress("UNCHECKED_CAST") val impacted = parsed["impactedTargets"] as List<String>
+      assertThat(impacted.map { it.removePrefix("@@") }).contains("//:generated")
+    } finally {
+      serveThread.interrupt()
+      serveThread.join(10_000)
+    }
+  }
+
+  private fun git(workspace: File, vararg args: String): String {
+    val proc =
+        ProcessBuilder(listOf("git") + args).directory(workspace).redirectErrorStream(true).start()
+    val output = proc.inputStream.readBytes().decodeToString()
+    check(proc.waitFor() == 0) { "git ${args.joinToString(" ")} failed: $output" }
+    return output.trim()
   }
 
   /** Polls `/health` until it returns 200, up to ~30s, failing the test otherwise. */
@@ -1460,17 +1511,16 @@ class E2ETest {
   }
 
   @Test
-  fun testPackageGroupChangeIsNotImpacted_reproducerForIssue441() {
-    // Reproducer for https://github.com/Tinder/bazel-diff/issues/441
+  fun testPackageGroupChangeImpactsConsumers_regressionForIssue441() {
+    // Regression test for the under-invalidation (false-negative) half of
+    // https://github.com/Tinder/bazel-diff/issues/441.
     //
-    // The under-invalidation (false-negative) half of the issue. bazel-diff only
-    // keeps targets whose query `Discriminator` is RULE, SOURCE_FILE, or
-    // GENERATED_FILE; every other type is dropped
-    // (BazelQueryService.toBazelTarget -> logs "Unsupported target type" and
-    // returns null). `PACKAGE_GROUP` is one such dropped type, so a change to a
-    // package_group's `packages` list is never reflected in any hash -- even
-    // though it genuinely alters downstream visibility and can flip a consumer
-    // from building to failing.
+    // bazel-diff used to keep only targets whose query `Discriminator` is RULE,
+    // SOURCE_FILE, or GENERATED_FILE; `PACKAGE_GROUP` was dropped
+    // (BazelQueryService.toBazelTarget logged "Unsupported target type" and
+    // returned null), so a change to a package_group's `packages` list was never
+    // reflected in any hash -- even though it genuinely alters downstream
+    // visibility and can flip a consumer from building to failing.
     //
     // The `package_group_dropped` workspace:
     //   //lib:consumers -- a package_group (created by a macro in lib/defs.bzl)
@@ -1485,13 +1535,12 @@ class E2ETest {
     // //consumer:use_thing successfully, workspace B fails visibility analysis
     // for it. The BUILD files and every native rule are byte-for-byte identical
     // across the checkouts, so the sole semantic change rides entirely on the
-    // (dropped) PACKAGE_GROUP target.
+    // PACKAGE_GROUP target.
     //
-    // Current (buggy) behaviour: bazel-diff reports ZERO impacted targets. When
-    // #441's under-invalidation is fixed (e.g. by supporting PACKAGE_GROUP
-    // targets and their reverse-visibility dependents), the changed package_group
-    // -- and/or //consumer:use_thing -- should start appearing here and this
-    // assertion will flag that the behaviour changed.
+    // Fixed behaviour: the package_group is lowered to a synthetic rule and
+    // hashed, and RuleHasher follows the (nodep) `visibility` edge from
+    // //lib:thing to it -- so the group, the rule it gates, and that rule's
+    // transitive dependents are all reported.
     val workspaceA = copyTestWorkspace("package_group_dropped")
     val workspaceB = copyTestWorkspace("package_group_dropped")
 
@@ -1534,20 +1583,18 @@ class E2ETest {
         filterBazelDiffInternalTargets(
             impactedTargetsOutput.readLines().filter { it.isNotBlank() }.toSet())
 
-    // The genuinely-affected consumer is NOT reported -- pinning the false
-    // negative. (It flips from building to failing visibility analysis, yet its
-    // hash, and every other rule/source-file hash, is unchanged.)
-    assertThat(impacted.contains("//consumer:use_thing")).isEqualTo(false)
-
-    // Nothing at all is reported: the package_group is dropped, so the change is
-    // completely invisible to bazel-diff. This is exactly the under-invalidation
-    // #441 describes.
+    // The changed package_group itself, the rule it gates (via the visibility
+    // edge), and that rule's transitive dependents -- including generated files
+    // -- are all reported. In particular //consumer:use_thing, which really does
+    // flip from building to failing visibility analysis, is now surfaced.
     assertThat(impacted)
-        .transform(
-            "editing a dropped PACKAGE_GROUP's `packages` list should surface an impacted target, but got: $impacted") {
-              it.size
-            }
-        .isEqualTo(0)
+        .isEqualTo(
+            setOf(
+                "//lib:consumers",
+                "//lib:thing",
+                "//lib:thing.txt",
+                "//consumer:use_thing",
+                "//consumer:use_thing.txt"))
   }
 
   /**
