@@ -946,7 +946,11 @@ class RunGateTest(unittest.TestCase):
     def test_passes_when_rust_is_consistently_faster(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            binaries = self._binaries(root, kotlin_sleep=0.2, rust_sleep=0.0)
+            # The margin has to dwarf scheduler noise: with only 0.2s a loaded
+            # runner occasionally stalls the fast stub past the slow one, and
+            # the default min_win_rate=1.0 fails the whole gate on one lost
+            # round.
+            binaries = self._binaries(root, kotlin_sleep=1.0, rust_sleep=0.0)
             reports = run_gate(
                 _stub_specs(),
                 binaries,
@@ -961,7 +965,7 @@ class RunGateTest(unittest.TestCase):
     def test_fails_when_rust_is_slower(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            binaries = self._binaries(root, kotlin_sleep=0.0, rust_sleep=0.2)
+            binaries = self._binaries(root, kotlin_sleep=0.0, rust_sleep=1.0)
             reports = run_gate(
                 _stub_specs(),
                 binaries,
