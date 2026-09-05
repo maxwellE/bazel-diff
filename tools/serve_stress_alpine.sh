@@ -4,15 +4,16 @@
 #   .github/workflows/serve-stress-alpine-real.yml  (real repos via REAL_* env)
 #
 # Runs tools/serve_stress.py inside an x86_64 Alpine (musl) container hard-capped at 8 GiB /
-# few vCPUs, to surface performance choke points on a low-resource node: JVM startup + heap
-# pressure for serve, `bazel query` server cost, git checkout latency, and OOM behavior that a
+# few vCPUs, to surface performance choke points on a low-resource node: serve's own memory
+# footprint, `bazel query` server cost, git checkout latency, and OOM behavior that a
 # 4-core/16 GiB glibc runner never shows. Hermetic and real-repo modes share this entry so the
 # musl / cgroup footprint path is identical; only the harness args differ.
 #
 # The host workflow stages everything this script needs into one directory (mounted here,
 # path-independent -- the script locates it from $0):
 #
-#   <stage>/bazel-diff.jar            the //cli:bazel-diff_deploy.jar built on the glibc host
+#   <stage>/bazel-diff                the statically linked musl binary built on the host
+#                                     (`bazel build //release:bazel-diff --config=release-musl`)
 #   <stage>/bazel-glibc               the official bazel release binary (see version note below)
 #   <stage>/.bazelversion             copied into fabricated workspaces (harness expects it)
 #   <stage>/tools/serve_stress.py     the harness + its shared plumbing + this script
@@ -24,12 +25,11 @@
 # newer Bazel to parse its BUILD files; floating/missing pins still fall back to bazel-diff's
 # pin. Either way this script just probes and runs whatever binary was staged.
 #
-# Building bazel-diff *inside* Alpine would require a full glibc Bazel toolchain to work under
-# musl -- the most fragile possible path -- so the jar is built on the host and only *run* here,
-# on Alpine's own musl OpenJDK. The one genuinely glibc-bound piece is the `bazel` binary that
-# serve shells out to for `bazel query`: official releases are glibc-linked and there is no
-# official musl build. Two flavors are attempted, best first, each proven with a real probe
-# query before the 30+ minute harness commits to it:
+# bazel-diff itself is the published Linux asset: statically linked against musl, so it runs
+# on Alpine as-is with no runtime to install. The one genuinely glibc-bound piece is the
+# `bazel` binary that serve shells out to for `bazel query`: official releases are
+# glibc-linked and there is no official musl build. Two flavors are attempted, best first,
+# each proven with a real probe query before the 30+ minute harness commits to it:
 #
 #   1. the official release binary under gcompat (glibc shim), with the server JVM redirected to
 #      the musl OpenJDK via a system bazelrc (`startup --server_javabase=...`) -- hermetic runs
@@ -58,8 +58,8 @@ cat /etc/alpine-release
 
 # ------------------------------------------------------------------------------------------
 # Packages: harness deps (python3, git + git daemon), ca-certificates for HTTPS real-repo
-# clones, the musl JDK that runs both the serve jar and (redirected) bazel server, and the
-# glibc shim for the official bazel client.
+# clones, the musl JDK that runs the (redirected) bazel server, and the glibc shim for the
+# official bazel client. bazel-diff itself needs nothing: it is a static binary.
 # ------------------------------------------------------------------------------------------
 apk add --no-cache python3 git git-daemon ca-certificates openjdk21-jdk gcompat libstdc++ libgcc
 
@@ -68,23 +68,22 @@ if [ ! -x "$JAVA_HOME/bin/java" ]; then
     JAVA_HOME=$(ls -d /usr/lib/jvm/java-21-openjdk* 2>/dev/null | head -1)
 fi
 [ -n "$JAVA_HOME" ] && [ -x "$JAVA_HOME/bin/java" ] || {
-    echo "ERROR: no usable JDK under /usr/lib/jvm" >&2; exit 2; }
+    echo "ERROR: no usable JDK under /usr/lib/jvm (the bazel server needs one)" >&2; exit 2; }
 export JAVA_HOME
 export PATH="$JAVA_HOME/bin:$PATH"
 java -version 2>&1 | head -2
 
 # ------------------------------------------------------------------------------------------
-# The launcher the harness invokes (base.LAUNCHER = <stage>/bazel-bin/cli/bazel-diff, since
-# REPO_ROOT is derived from serve_stress.py's location). A bazel-built java_binary launcher
-# does not survive the host->container move (runfiles + embedded JDK paths), so a plain
-# wrapper over the staged deploy jar stands in for it; --skip-build makes the harness use it.
+# The launcher the harness invokes (base.LAUNCHER = <stage>/bazel-bin/src/bazel-diff, since
+# REPO_ROOT is derived from serve_stress.py's location). bazel-bin is a symlink into the
+# host's output base and does not survive the host->container move, so the staged static
+# binary is placed at that path; --skip-build makes the harness use it.
 # ------------------------------------------------------------------------------------------
-mkdir -p "$STAGE/bazel-bin/cli"
-cat > "$STAGE/bazel-bin/cli/bazel-diff" <<'EOF'
-#!/bin/sh
-exec java -jar "$(dirname "$0")/../../bazel-diff.jar" "$@"
-EOF
-chmod +x "$STAGE/bazel-bin/cli/bazel-diff"
+[ -x "$STAGE/bazel-diff" ] || { echo "ERROR: no staged bazel-diff binary at $STAGE/bazel-diff" >&2; exit 2; }
+mkdir -p "$STAGE/bazel-bin/src"
+cp "$STAGE/bazel-diff" "$STAGE/bazel-bin/src/bazel-diff"
+chmod +x "$STAGE/bazel-bin/src/bazel-diff"
+"$STAGE/bazel-bin/src/bazel-diff" --version
 
 # ------------------------------------------------------------------------------------------
 # Pick a bazel that actually works on this musl userland (see flavor list in the header).

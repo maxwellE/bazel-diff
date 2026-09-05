@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """A recording, in-memory mock of the small slice of S3 that `bazel-diff serve` uses.
 
-`S3HashCacheStorage` only ever issues GetObject, PutObject and HeadObject against a single bucket
-(see cli/src/main/kotlin/com/bazel_diff/server/S3HashCacheStorage.kt), so a few hundred lines of
+The serve S3 cache tier only ever issues GetObject, PutObject and HeadObject against a single
+bucket (see the S3 storage in src/server.rs), so a few hundred lines of
 stdlib `http.server` stand in for MinIO/LocalStack with no container and no third-party dependency
 -- and, unlike a real bucket, this one *records every request*. That recording is the point: it is
 what lets `serve_consistency.py` compare the hash payloads several `serve` instances independently
@@ -632,7 +632,7 @@ def mock_s3(bucket: str, prefixes: Mapping[str, str] | None = None, mode: str = 
 def instance_prefixes(instance_ids: Sequence[str]) -> dict:
     """`["i0", "i1"]` -> `{"i0": "i0/", "i1": "i1/"}` -- the prefix layout the harness uses.
 
-    Note that `--s3Prefix` is deliberately absent from `ServeCommand.computeConfigFingerprint()`,
+    Note that `--s3Prefix` is deliberately absent from the serve config fingerprint,
     so giving each instance its own prefix keeps writes attributable *without* changing the cache
     key the instances compute. That is what makes cross-instance comparison possible at all.
     """

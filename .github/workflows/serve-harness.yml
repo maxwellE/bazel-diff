@@ -1,8 +1,8 @@
 name: Serve Harness
 
 # Integration validation for the `bazel-diff serve` query service. Runs tools/serve_harness.py,
-# which builds //cli:bazel-diff and drives the real binary over HTTP against a live git:// remote
-# (git daemon) across full/shallow/partial clones -- coverage the in-process E2ETest cannot reach.
+# which builds //src:bazel-diff and drives the real binary over HTTP against a live git:// remote
+# (git daemon) across full/shallow/partial clones -- coverage the in-process e2e cases cannot reach.
 # See the harness module docstring for the scenario matrix.
 
 # Cron-only for now while we confirm the harness is stable on CI runners. Once it has a healthy
@@ -24,11 +24,6 @@ jobs:
       matrix:
         bazel: [ '8.x', '9.x' ]
     steps:
-      - name: Setup Java JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'
       - name: Setup Go environment
         uses: actions/setup-go@v5
         with:

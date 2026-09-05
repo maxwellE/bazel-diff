@@ -13,7 +13,7 @@ This directory contains everything needed to build, validate, and run that:
 | --- | --- | --- |
 | `bench/gen_project.py` | Synthetic large-Bazel-project generator (no external toolchains) | anywhere |
 | `bench/bench.py` | Cold-vs-warm analysis-time benchmark (the addressable win) | anywhere |
-| `bazel-diff fingerprint` / `warmup` | CLI hooks (Kotlin, in `//cli`) | anywhere |
+| `bazel-diff fingerprint` / `warmup` | CLI hooks (in `//src`) | anywhere |
 | `bazel-diff-snap` (this Go module) | `record` / `consume` orchestrator | Linux+KVM (real), anywhere (local driver) |
 
 ## Why the cold-vs-warm benchmark proves the win
@@ -38,8 +38,10 @@ python3 bench/gen_project.py --out /tmp/bigproj --packages 3000 \
     --targets-per-package 4 --git
 # -> prints {"base_sha": "...", "target_sha": "...", ...}
 
-# 2. build bazel-diff
-bazel run //:bazel-diff --script_path=/tmp/bazel_diff
+# 2. build bazel-diff (a self-contained binary; --config=release-musl on Linux
+#    if it is going into a container or guest image)
+bazel build //release:bazel-diff --config=release
+cp bazel-bin/release/bazel-diff-rust-* /tmp/bazel_diff
 
 # 3. benchmark cold vs warm
 python3 bench/bench.py \
@@ -51,7 +53,7 @@ python3 bench/bench.py \
 
 `gen_project.py` builds a **layered** genrule DAG: packages are partitioned into
 `--layers` bands and a package depends on a few packages in the previous band.
-This gives real depth + width and real source files for `SourceFileHasher` to
+This gives real depth + width and real source files for the source-file hasher to
 hash — all with **zero** external toolchains, so the cold path actually
 re-analyses on every run and the benchmark is reproducible. Layering bounds the
 graph *depth* (default 40), which matters at scale: bazel-diff hashes
@@ -64,21 +66,21 @@ The whole flow above also runs in a Linux container — the actual CI target OS 
 via [`bench/run_docker_bench.sh`](bench/run_docker_bench.sh):
 
 ```bash
-bazel build //cli:bazel-diff_deploy.jar
+bazel build //release:bazel-diff --config=release-musl-arm64   # or --config=release-musl on amd64
 (cd tools/firecracker && GOOS=linux GOARCH=arm64 go build -o /tmp/bazel-diff-snap-linux-arm64 .)
 ARCH=arm64 SNAP=/tmp/bazel-diff-snap-linux-arm64 \
     tools/firecracker/bench/run_docker_bench.sh 11500 2   # ~150k targets, 2 iters
 # results land in .bench-results/ (report.json, target_count.txt, impacted.txt)
 ```
 
-The image bundles a JDK, bazelisk, git, the bazel-diff fat jar, and the Go
-orchestrator. It does **not** run Firecracker itself — that needs `/dev/kvm`,
+The image bundles a JDK (for the Bazel server), bazelisk, git, the statically
+linked bazel-diff binary, and the Go orchestrator. It does **not** run Firecracker itself — that needs `/dev/kvm`,
 which Docker-for-Mac does not expose; real microVM record/consume runs on the
 self-hosted Linux+KVM host.
 
-## CLI hooks (`//cli`)
+## CLI hooks (`//src`)
 
-Two picocli subcommands implement RFC §4 (Phase 1, pure Kotlin, unit-tested):
+Two subcommands implement RFC §4 (Phase 1, pure Rust, unit-tested):
 
 - **`bazel-diff fingerprint`** — computes the snapshot cache key over the inputs
   that affect the build graph (bazel version, `MODULE.bazel.lock`, `.bazelrc`,
@@ -139,8 +141,10 @@ go test ./...                          # pure logic + API client, runs anywhere
 sudo tools/firecracker/bench/setup_tap.sh         # fc-tap0, host 172.16.0.1/30
 
 # 2. kernel + rootfs.base.ext4 with JDK + bazel + git + bazel-diff + workspace
+#    (the static musl build for the guest's ARCH, aarch64 by default)
+bazel build //release:bazel-diff --config=release-musl-arm64
 sudo -E OUT=/tmp/fc-image \
-    BAZEL_DIFF_JAR=bazel-bin/cli/bazel-diff_deploy.jar \
+    BAZEL_DIFF_BIN=bazel-bin/release/bazel-diff-rust-linux-arm64 \
     BAZEL_BIN=$(which bazelisk) WORKSPACE_SRC=/tmp/bigproj \
     SSH_PUBKEY=~/.ssh/fc_guest.pub \
     tools/firecracker/bench/build_guest_image.sh

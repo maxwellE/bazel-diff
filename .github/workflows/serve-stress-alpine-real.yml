@@ -57,11 +57,6 @@ jobs:
     steps:
       - name: Compute stage dir
         run: echo "STAGE=$RUNNER_TEMP/alpine-stage-${{ matrix.size }}" >> "$GITHUB_ENV"
-      - name: Setup Java JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'
       - name: Setup Go environment
         uses: actions/setup-go@v5
         with:
@@ -70,12 +65,16 @@ jobs:
       - name: Setup Bazelisk
         run: go install github.com/bazelbuild/bazelisk@latest
       - uses: actions/checkout@v4
-      - name: Build bazel-diff deploy jar (glibc host)
-        run: ~/go/bin/bazelisk build //cli:bazel-diff_deploy.jar
+      # The published Linux asset: statically linked against musl, so it runs
+      # on Alpine as-is. Built here rather than in the container because the
+      # build needs the full Bazel + Rust toolchain, which only has to work on
+      # the glibc host.
+      - name: Build bazel-diff (static musl binary)
+        run: ~/go/bin/bazelisk build //release:bazel-diff --config=release-musl
       - name: Stage container inputs
         run: |
           mkdir -p "$STAGE/tools"
-          cp bazel-bin/cli/bazel-diff_deploy.jar "$STAGE/bazel-diff.jar"
+          cp bazel-bin/release/bazel-diff-rust-linux-amd64 "$STAGE/bazel-diff"
           cp tools/serve_stress.py tools/serve_harness.py tools/serve_stress_alpine.sh "$STAGE/tools/"
           cp .bazelversion "$STAGE/"
           FALLBACK_BV=$(tr -d '[:space:]' < .bazelversion)

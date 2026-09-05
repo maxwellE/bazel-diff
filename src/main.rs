@@ -351,7 +351,7 @@ fn normalize_path(path: PathBuf) -> PathBuf {
 /// `chdir("")` ENOENT that names the Bazel binary rather than the workspace;
 /// normalizing `../sibling` on its own pops nothing and silently yields
 /// `sibling`. Anchoring to the working directory gives both the directory the
-/// user meant, matching the Kotlin CLI. See
+/// user meant, matching the original JVM CLI this replaced. See
 /// <https://github.com/Tinder/bazel-diff/issues/470>.
 fn parse_normalized_path(value: &str) -> Result<PathBuf, String> {
     let absolute = std::path::absolute(value)

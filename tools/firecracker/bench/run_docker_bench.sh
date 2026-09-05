@@ -2,8 +2,8 @@
 # Host-side driver: stages artifacts, builds the Linux benchmark image, and runs
 # the cold-vs-warm benchmark + local-driver orchestrator inside a container.
 #
-# Prereqs (run from repo root):
-#   bazel build //cli:bazel-diff_deploy.jar
+# Prereqs (run from repo root; pick the musl config matching the docker host):
+#   bazel build //release:bazel-diff --config=release-musl-arm64   # or --config=release-musl (amd64)
 #   (cd tools/firecracker && GOOS=linux GOARCH="$ARCH" go build -o /tmp/bazel-diff-snap-linux .)
 #
 # Usage:
@@ -16,14 +16,21 @@ ARCH=${ARCH:-arm64}            # docker host arch (arm64 on Apple Silicon)
 REPO_ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 BENCH_DIR="$REPO_ROOT/tools/firecracker/bench"
 
-JAR="$REPO_ROOT/bazel-bin/cli/bazel-diff_deploy.jar"
+# //release:bazel-diff names the asset after the platform it was built for,
+# and both docker host architectures map onto a published Linux asset.
+case "$ARCH" in
+  arm64|aarch64) ASSET=bazel-diff-rust-linux-arm64 ;;
+  amd64|x86_64) ASSET=bazel-diff-rust-linux-amd64 ;;
+  *) echo "unsupported ARCH=$ARCH (expected arm64 or amd64)"; exit 1 ;;
+esac
+BINARY="${BINARY:-$REPO_ROOT/bazel-bin/release/$ASSET}"
 SNAP="${SNAP:-/tmp/bazel-diff-snap-linux-$ARCH}"
-[ -f "$JAR" ] || { echo "missing $JAR — run: bazel build //cli:bazel-diff_deploy.jar"; exit 1; }
+[ -f "$BINARY" ] || { echo "missing $BINARY — run: bazel build //release:bazel-diff --config=release-musl(-arm64)"; exit 1; }
 [ -f "$SNAP" ] || { echo "missing $SNAP — cross-compile the go binary first"; exit 1; }
 
 STAGE=$(mktemp -d)
 trap 'rm -rf "$STAGE"' EXIT
-cp "$JAR" "$STAGE/bazel-diff.jar"
+cp "$BINARY" "$STAGE/bazel-diff"
 cp "$SNAP" "$STAGE/bazel-diff-snap"
 cp "$BENCH_DIR/Dockerfile" "$BENCH_DIR/gen_project.py" \
    "$BENCH_DIR/bench.py" "$BENCH_DIR/run_in_container.sh" "$STAGE/"

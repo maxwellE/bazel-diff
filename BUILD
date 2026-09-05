@@ -1,4 +1,3 @@
-load("@rules_kotlin//kotlin:core.bzl", "define_kt_toolchain")
 load("@rules_license//rules:license.bzl", "license")
 load("@rules_rust//rust:defs.bzl", "rust_clippy_test", "rustfmt_test")
 
@@ -11,15 +10,19 @@ exports_files(
     visibility = ["//src:__pkg__"],
 )
 
+# The bazel-diff CLI. `bazel run //:bazel-diff -- --help`.
 alias(
     name = "bazel-diff",
-    actual = "//cli:bazel-diff",
+    actual = "//src:bazel-diff",
 )
 
+# Kept as a second name for the same binary: it is what the BCR presubmit's
+# verify_targets, the release rule under //release and existing consumers
+# build, from when the JVM CLI owned the `bazel-diff` name and this was the
+# Rust candidate. Both aliases resolve to the one implementation.
 alias(
     name = "bazel-diff-rust",
     actual = "//src:bazel-diff",
-    visibility = ["//visibility:public"],
 )
 
 test_suite(
@@ -64,9 +67,11 @@ rustfmt_test(
     transitive = True,
 )
 
+# `bazel run //:format` rewrites the Rust sources with the pinned rustfmt; see
+# //tools/format for the Starlark formatter.
 alias(
     name = "format",
-    actual = "//cli/format:format",
+    actual = "//tools/format:rustfmt",
 )
 
 package(
@@ -82,9 +87,4 @@ license(
     license_text = "LICENSE",
     package_url = "https://github.com/Tinder/bazel-diff",
     package_version = "46.0.0",
-)
-
-define_kt_toolchain(
-    name = "kotlin_toolchain",
-    jvm_target = "11",
 )

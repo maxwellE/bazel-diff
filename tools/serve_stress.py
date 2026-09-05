@@ -55,7 +55,7 @@ target's real ancestry commits, so the clone must be deep enough (`--real-clone-
 
 Usage:
     tools/serve_stress.py                       # build, then run every hermetic phase
-    tools/serve_stress.py --skip-build          # reuse an existing bazel-bin/cli/bazel-diff
+    tools/serve_stress.py --skip-build          # reuse an existing bazel-bin/src/bazel-diff
     tools/serve_stress.py --quick               # reduced request counts (sanity profile)
     tools/serve_stress.py --only lock           # run only phases whose name contains "lock"
     tools/serve_stress.py --metrics-out m.json --summary-out s.md
@@ -1350,8 +1350,8 @@ def main() -> int:
         return 2
 
     if not args.skip_build:
-        base.log(f"{base.C.BOLD}Building //cli:bazel-diff ...{base.C.RESET}")
-        base.run([base.BAZEL, "build", "//cli:bazel-diff"], cwd=base.REPO_ROOT)
+        base.log(f"{base.C.BOLD}Building //src:bazel-diff ...{base.C.RESET}")
+        base.run([base.BAZEL, "build", "//src:bazel-diff"], cwd=base.REPO_ROOT)
     if not base.LAUNCHER.exists():
         base.log(f"{base.C.RED}launcher not found at {base.LAUNCHER}; run without --skip-build{base.C.RESET}")
         return 2

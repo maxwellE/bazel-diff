@@ -7,7 +7,7 @@ the comment block in tools/BUILD).
 
 `compare_payloads` / `divergence_verdict` are the load-bearing pair: they decide whether a run
 reports "hashes are consistent" or names diverging targets, so they are tested against the two
-payload shapes `HashService.serialize` emits and against the failure modes that would otherwise
+payload shapes the serve hash serializer emits and against the failure modes that would otherwise
 produce a false green -- most importantly the JSON key-order difference that is *expected* between
 hosts and must not be reported as divergence.
 """
@@ -19,7 +19,7 @@ import serve_consistency as sc
 
 
 def _payload(hashes, module_graph=None, dep_edges=None, *, wrapped=None):
-    """Serializes [hashes] the way HashService.serialize does."""
+    """Serializes [hashes] the way the serve hash serializer does."""
     if wrapped is None:
         wrapped = module_graph is not None or dep_edges is not None
     if not wrapped:
@@ -63,7 +63,7 @@ class ComparePayloadsTest(unittest.TestCase):
         self.assertEqual(status, sc.base.PASS)
 
     def test_key_order_difference_is_not_divergence(self):
-        # HashService.serialize gsons a HashMap built by Collectors.toMap over a *parallel* stream,
+        # The JVM serve used to write a HashMap built by Collectors.toMap over a *parallel* stream,
         # so key order tracks the host's CPU count. Two hosts may legitimately differ here.
         reordered = dict(reversed(list(HASHES.items())))
         div = sc.compare_payloads({"i0": _payload(HASHES), "i1": _payload(reordered)})

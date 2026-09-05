@@ -13,15 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        java: [ '11' ]
         bazel: ['8.x']
     steps:
-      - name: Setup Java JDK
-        uses: actions/setup-java@v3
-        with:
-          distribution: 'temurin'
-          java-version: ${{ matrix.java }}
-        id: java
       - uses: actions/checkout@v3
         with:
           repository: tinder-maxwellelliott/bazel-diff-repro-1
@@ -39,7 +32,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bazel-diff-artifacts-java-${{ matrix.java }}-bazel-${{ matrix.bazel }}
+          name: bazel-diff-artifacts-bazel-${{ matrix.bazel }}
           path: |
             /tmp/impacted_targets.txt
             /tmp/bazel-diff*.log
