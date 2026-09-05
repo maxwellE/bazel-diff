@@ -8,56 +8,47 @@
 release_source_archive:
 	.github/workflows/pack_release_archive.sh archives/release.tar.gz
 
-.PHONY: release_deploy_jar
-release_deploy_jar:
-	bazel \
-		build \
-		//cli:bazel-diff_deploy.jar \
-		-c opt
-
 # Builds the same artifact CI publishes, named the same way:
 # bazel-bin/release/bazel-diff-rust-<os>-<arch>[.exe].
-.PHONY: release_rust_binary
-release_rust_binary:
+.PHONY: release_binary
+release_binary:
 	bazel \
 		build \
-		//release:bazel-diff-rust \
+		//release:bazel-diff \
 		--config=release
 
 # The published Linux binaries, which are not host-native: they are statically
 # linked against musl so they run on any distribution, and cross-compile from a
 # glibc Linux host or an Apple Silicon Mac. Same output path and asset name.
-.PHONY: release_rust_binary_linux
-release_rust_binary_linux:
+.PHONY: release_binary_linux
+release_binary_linux:
 	bazel \
 		build \
-		//release:bazel-diff-rust \
+		//release:bazel-diff \
 		--config=release-musl
 
-.PHONY: release_rust_binary_linux_arm64
-release_rust_binary_linux_arm64:
+.PHONY: release_binary_linux_arm64
+release_binary_linux_arm64:
 	bazel \
 		build \
-		//release:bazel-diff-rust \
+		//release:bazel-diff \
 		--config=release-musl-arm64
 
-.PHONY: build_rust
-build_rust:
-	bazel build //:bazel-diff-rust -c opt
+.PHONY: build
+build:
+	bazel build //:bazel-diff -c opt
 
-# Both go through Bazel so they use the same formatters CI gates on. `cargo fmt
-# --all` is not equivalent: it only sees the root crate, missing tools/coverage,
-# and it uses whatever rustfmt is on PATH rather than the pinned one.
+# Goes through Bazel so it uses the same rustfmt CI gates on. `cargo fmt --all`
+# is not equivalent: it only sees the root crate, missing tools/coverage, and it
+# uses whatever rustfmt is on PATH rather than the pinned one.
 .PHONY: format
 format:
-	bazel run //cli/format
-	bazel run //cli/format:rustfmt
+	bazel run //tools/format:rustfmt
 
 # Regenerates the per-case e2e test targets from the e2e sources. Run it after
-# adding, renaming or removing a `@Test` method under
-# cli/src/test/kotlin/com/bazel_diff/e2e/ or a `#[test]` fn under tests/e2e/,
-# and commit the result -- `e2e-split-regen` in ci.yaml fails the build if the
-# checked-in split is stale. See tools/e2e/README.md.
+# adding, renaming or removing a `#[test]` fn under tests/e2e/, and commit the
+# result -- `e2e-split-regen` in ci.yaml fails the build if the checked-in
+# split is stale. See tools/e2e/README.md.
 .PHONY: regen-e2e
 regen-e2e:
 	bazel run //tools/e2e:regen
@@ -73,7 +64,7 @@ generate-readme:
 
 .PHONY: coverage
 coverage:
-	bazel coverage --combined_report=lcov //cli/... //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/...
+	bazel coverage --combined_report=lcov //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/...
 	bazel run //tools:coverage-check -- bazel-out/_coverage/_coverage_report.dat
 	bazel run //tools:coverage-check -- --include tools/go/ --threshold 90 bazel-out/_coverage/_coverage_report.dat
 
@@ -88,42 +79,6 @@ coverage-test:
 
 .PHONY: coverage-html
 coverage-html:
-	bazel coverage --combined_report=lcov //cli/... //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/...
+	bazel coverage --combined_report=lcov //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/...
 	bazel run //tools:coverage-check -- bazel-out/_coverage/_coverage_report.dat --html coverage-html
 	@echo "Open coverage-html/index.html in a browser to inspect."
-
-.PHONY: coverage_rust
-coverage_rust:
-	bazel coverage //src:cli_tests //src:rust_tests
-
-.PHONY: benchmark
-benchmark:
-	@test -n "$(WORKSPACE)" || (echo "usage: make benchmark WORKSPACE=/path/to/bazel [BAZEL=/path/to/bazelisk] [HYPERFINE=/path/to/hyperfine] [STREAMED_PROTO=/path/to/targets.pb] [INCLUDE_BAZEL=1] [ITERATIONS=10] [WARMUP=3] [RSS_RUNS=5] [JSON=benchmark.json]" >&2; exit 2)
-	$(or $(BAZEL),bazel) run -c opt //tools:benchmark -- \
-		--workspace "$(WORKSPACE)" \
-		--bazel "$(or $(BAZEL),bazel)" \
-		--hyperfine "$(or $(HYPERFINE),hyperfine)" \
-		--iterations "$(or $(ITERATIONS),10)" \
-		--warmup "$(or $(WARMUP),3)" \
-		--rss-runs "$(or $(RSS_RUNS),5)" \
-		$(if $(STREAMED_PROTO),--streamed-proto "$(STREAMED_PROTO)",) \
-		$(if $(INCLUDE_BAZEL),--include-bazel,) \
-		$(if $(JSON),--json "$(JSON)",)
-
-# Hermetic Kotlin-vs-Rust performance gate. Unlike `make benchmark` this needs no
-# workspace, no Bazel server and no Hyperfine: it generates its own fixtures and fails
-# (exit 1) if Rust is not faster than Kotlin on every workload. JSON=... must be an
-# absolute path -- `bazel run` executes from the runfiles tree, not the repo root.
-.PHONY: perf-gate
-perf-gate:
-	$(or $(BAZEL),bazel) run -c opt //tools:perf-gate -- \
-		--rounds "$(or $(ROUNDS),5)" \
-		--warmup-rounds "$(or $(WARMUP),1)" \
-		--scale "$(or $(SCALE),1)" \
-		$(if $(WORKLOAD),--workload "$(WORKLOAD)",) \
-		$(if $(RSS_RUNS),--rss-runs "$(RSS_RUNS)",) \
-		$(if $(JSON),--json "$(JSON)",)
-
-.PHONY: perf-gate-test
-perf-gate-test:
-	$(or $(BAZEL),bazel) test //tools:perf_gate_test

@@ -6,12 +6,15 @@ Usage:
 Defaults:
     LCOV_FILE   bazel-out/_coverage/_coverage_report.dat
     --threshold 90 (or $COVERAGE_THRESHOLD)
-    --include   cli/src/main/,tools/coverage_check.py
+    --include   src/,tools/coverage_check.py
 
 Only production-source files (whose path matches one of the include prefixes)
-contribute to the numerator and denominator. Bazel's Kotlin and Python
-instrumentation report test sources too; including them would let thin
-production-code coverage hide behind well-covered tests, so they are stripped.
+contribute to the numerator and denominator. The Python instrumentation reports
+test sources too; including them would let thin production-code coverage hide
+behind well-covered tests, so they are stripped. (The Rust unit tests live in
+`#[cfg(test)]` modules inside the `src/` files themselves, so they are counted
+along with the code they cover -- the same scope the per-target minimum on
+//src:rust_tests uses.)
 
 Exit codes:
     0  overall coverage meets or exceeds the threshold
@@ -218,12 +221,10 @@ def main(argv: List[str] | None = None) -> int:
     )
     parser.add_argument(
         "--include",
-        default=os.environ.get(
-            "COVERAGE_INCLUDE", "cli/src/main/,tools/coverage_check.py"
-        ),
+        default=os.environ.get("COVERAGE_INCLUDE", "src/,tools/coverage_check.py"),
         help=(
             "Comma-separated path prefixes counted as production code "
-            "(default: cli/src/main/,tools/coverage_check.py)."
+            "(default: src/,tools/coverage_check.py)."
         ),
     )
     parser.add_argument(
@@ -252,7 +253,7 @@ def main(argv: List[str] | None = None) -> int:
     if not os.path.isfile(args.lcov):
         print(f"error: LCOV report not found at '{args.lcov}'.", file=sys.stderr)
         print(
-            "Hint: run 'bazel coverage --combined_report=lcov //cli/... //tools/...' first,",
+            "Hint: run 'bazel coverage --combined_report=lcov //src/... //tools/...' first,",
             file=sys.stderr,
         )
         print("      or pass an explicit path as the first argument.", file=sys.stderr)

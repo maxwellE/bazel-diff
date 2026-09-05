@@ -74,7 +74,6 @@ bcr_test_module:
       - '--cxxopt=-std=c++17'
       - '--host_cxxopt=-std=c++17'
       build_targets:
-      - '//:bazel-diff-rust'
+      - '//:bazel-diff'
       test_targets:
-      - '//cli/...'
       - '//:rust_tests'

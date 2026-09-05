@@ -1,62 +1,46 @@
 ---
 name: improve-coverage
-description: Use when you need to raise main-source line coverage in the bazel-diff repo, write tests for an under-covered Kotlin file, fix a CI failure on the 90% coverage gate, or pick the highest-leverage files to test next. Triggers on requests like "the coverage gate is failing, fix it", "write tests for X", "we need more coverage", or "what should I test to get to 90%".
+description: Use when you need to raise main-source line coverage in the bazel-diff repo, write tests for an under-covered Rust module, fix a CI failure on the 90% coverage gate, or pick the highest-leverage files to test next. Triggers on requests like "the coverage gate is failing, fix it", "write tests for X", "we need more coverage", or "what should I test to get to 90%".
 ---
 
 # Improving coverage to clear the 90% gate
 
-bazel-diff enforces a 90% main-source line-coverage gate on every PR (see [coverage-status](../coverage-status/SKILL.md) for the inspection side). When the gate fails or you want to raise the bar, the workflow is: pick the worst-covered files, write small focused unit tests, re-run the gate locally before pushing.
+bazel-diff enforces a 90% main-source line-coverage gate on every PR (see [coverage-status](../coverage-status/SKILL.md) for the inspection side), plus per-target minimums on `//src:rust_tests` and `//src:cli_tests` that fire during `bazel coverage`. When the gate fails or you want to raise the bar, the workflow is: pick the worst-covered files, write small focused unit tests, re-run the gate locally before pushing.
 
 ## 1. Pick the right files to target
 
 Run `make coverage` (or check the latest CI artifact) and look at the top of the sorted table. Prioritise files by **uncovered-lines-per-test-effort**, not by lowest percentage:
 
-- **Highest-leverage**: small files at 0% (e.g. enum classes, value objects, single-method utilities) — one short unit test usually moves the needle without much code.
-- **Highest absolute gain**: large files with moderate coverage (e.g. `BazelQueryService.kt` at 303 lines / 93%) — closing a small percentage gap covers many lines.
+- **Highest-leverage**: small helpers at 0% (a parser, a converter, a value type's `Display`) — one short unit test usually moves the needle without much code.
+- **Highest absolute gain**: large files with moderate coverage (`src/server.rs`, `src/bazel.rs`, `src/main.rs`) — closing a small percentage gap covers many lines.
 - **Lowest leverage**: tiny files at 50–80% where the remaining branches are error paths needing fault injection or refactors.
-
-A worked example: the PR that added the gate ([#356](https://github.com/Tinder/bazel-diff/pull/356)) raised coverage from 88.76% → 90.37% by adding five small files of tests — `BazelTargetTypeTest`, `VersionProviderTest`, `BazelDiffTest`, `StderrLoggerTest`, `BazelTargetTest` — for a total of 26 newly-covered lines.
 
 ## 2. Write the test
 
 Existing tests follow a consistent shape:
 
-- Live under `cli/src/test/kotlin/...` mirroring the main source path.
-- Use **JUnit 4** (`@Test`, `@Before`, `@After`, `org.junit.Assert.assertThrows`).
-- Use **assertk** for assertions (`assertk.assertThat`, with explicit imports for each assertion like `assertk.assertions.isEqualTo`). Forgetting `import assertk.assertions.contains` on a `String.contains` assertion produces a confusing receiver-mismatch error — import every assertion you use.
-- Use **mockito-kotlin** when mocking is required (existing examples: `cli/src/test/kotlin/com/bazel_diff/bazel/BazelClientTest.kt`).
-- Use **koin** for DI-test setup (existing pattern: `cli/src/test/kotlin/com/bazel_diff/interactor/CalculateImpactedTargetsInteractorIssue335Test.kt`).
+- Unit tests live in a `#[cfg(test)] mod tests` at the bottom of the `src/` file they cover, and are run by `//src:rust_tests` (library) and `//src:cli_tests` (`main.rs`).
+- They test pure transformations with injected data: query planning, repository lowering, hash computation and module-impact decisions take their inputs as values, not as a live Bazel. Nothing under `src/` spawns a fake `bazel` executable — subprocess integration is the e2e suite's job.
+- Filesystem cases use `tempfile::TempDir`; server cases in `src/server.rs` bind a loopback port and drive the real HTTP handler.
+- Anything that needs a real Bazel workspace is an e2e case under `tests/e2e/` (see [tools/e2e/README.md](../../../tools/e2e/README.md) for the per-case target split and `make regen-e2e`). E2E cases are slow and carry no per-target coverage minimum, so prefer a unit test whenever the logic can be reached without Bazel.
 
-Tiny files (enums, value objects, small command classes) usually only need a few targeted tests. Looking at the bytes via `assertThat(BazelTargetType.entries).hasSize(N).containsExactlyInAnyOrder(...)` is enough to cover an enum's declaration lines.
-
-## 3. Register the test target in cli/BUILD
-
-Every test needs its own `kt_jvm_test` entry:
-
-```python
-kt_jvm_test(
-    name = "BazelTargetTypeTest",
-    test_class = "com.bazel_diff.bazel.BazelTargetTypeTest",
-    runtime_deps = [":cli-test-lib"],
-)
-```
-
-The `:cli-test-lib` glob picks up the new test source automatically; the explicit `kt_jvm_test` rule is what makes it executable via `bazel test //cli:<name>`.
-
-## 4. Verify locally before pushing
+## 3. Verify locally before pushing
 
 ```bash
-bazel test //cli:<YourNewTest>        # one-off run of the new test
-make coverage                          # full gate
+cargo test                                   # fastest inner loop (unit + e2e crate)
+bazel test //:rust_tests                     # what CI runs, with the pinned toolchain
+make coverage                                # the full gate
 ```
 
-The local number may be lower than CI's because `//cli:E2ETest` often fails or is excluded on dev machines (JDK-env sandbox issues). If you've added tests for a file that's also exercised by E2E (e.g. `BazelQueryService.kt`), the CI delta will be smaller than the local delta — count only the lines that weren't already covered by E2E.
+`bazel coverage` is what makes the per-target minimums fire: plain `bazel test` never invokes the LCOV merger. If a target falls below its minimum, its test log ends with the merger's per-file breakdown and the action exits 33.
 
-## 5. Things that don't work / aren't worth attempting
+Lint gates run on every build through the clippy and rustfmt aspects in `.bazelrc`; `make format` (`bazel run //tools/format:rustfmt`) fixes formatting with the exact rustfmt CI uses.
 
-- **`Main.kt`** — calls `exitProcess(...)` which kills the JVM; can't be tested in-process without a SecurityManager hack or refactor. Stays at 0%; the threshold tolerates it.
-- **`throw IllegalArgumentException(...)` branches in resource-loading code** like `VersionProvider.kt` — the production code resolves the classloader from `this::class.java`, with no injection seam to swap it for one missing the resource. Refactor or skip.
-- **`else -> BazelTargetType.UNKNOWN` branches** — only reachable when Bazel's `Build.Target.Discriminator` adds a new enum value the production code doesn't recognise. Triggering today would require a hand-forged proto with a reserved discriminator number, which the protobuf builder rejects.
+## 4. Things that don't work / aren't worth attempting
+
+- **`main()` in `src/main.rs`** — exits the process; the testable surface is the command functions it dispatches to, which the `cli_tests` target already covers. Test those, not `main`.
+- **`unreachable!` / exhaustive-match fallbacks** on generated protobuf enums — only reachable when Bazel's `Target.Discriminator` grows a new value. Not worth a hand-forged proto.
+- **Network error paths in the S3 cache tier** — covered by the loopback mock in `src/server.rs`'s tests; do not add real-bucket tests.
 
 ## When the gate fails on a flake, not on a coverage drop
 

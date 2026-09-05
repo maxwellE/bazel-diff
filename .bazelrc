@@ -1,10 +1,5 @@
 run -c opt --show_loading_progress=false --show_progress=false --ui_event_filters=error
 run:verbose -c dbg --show_loading_progress=true --show_progress=true --ui_event_filters=info,error,debug
-# https://github.com/mockito/mockito/issues/1879
-test --sandbox_tmpfs_path=/tmp
-
-# Use a hermetic JDK for tests.
-common --java_runtime_version=remotejdk_21
 
 # Enable platform-specific config
 common --enable_platform_specific_config
@@ -19,7 +14,7 @@ build:macos --host_cxxopt=-std=c++17
 build:windows --cxxopt=/std:c++17
 build:windows --host_cxxopt=/std:c++17
 
-# Release artifacts: `bazel build //release:bazel-diff-rust --config=release`.
+# Release artifacts: `bazel build //release:bazel-diff --config=release`.
 # CI uses nothing but this config, so the flags a published binary is built with
 # live here rather than in the workflow files. The C++ standard flags come from
 # the platform-specific configs above.
@@ -39,7 +34,7 @@ build:release --@rules_rust//rust/settings:lto=thin
 # property of the toolchain, which would change every build, not just releases.
 build:release --@rules_rust//rust/settings:extra_rustc_flags=-Cstrip=symbols
 
-# Linux release artifacts: `bazel build //release:bazel-diff-rust --config=release-musl`
+# Linux release artifacts: `bazel build //release:bazel-diff --config=release-musl`
 # (amd64) or `--config=release-musl-arm64` (arm64). Everything --config=release
 # does, but built for a musl platform, which makes the published Linux binary
 # statically linked: it runs on any distribution instead of requiring the glibc
@@ -78,10 +73,8 @@ build --output_groups=+rustfmt_checks
 # coverage mode anyway, so plain `bazel test` runs are never affected.
 coverage --coverage_output_generator=//tools/coverage:lcov_merger
 
-# Releases run the suite on cold runners (see release.yaml, which splits it
-# into a Java job and a Rust job), where the long suites -- //tests:e2e_test
-# (size = "enormous") and //cli:E2ETest (timeout = "eternal") -- have no
-# headroom left: v44.0.0 died on
+# Releases run the suite on cold runners (see release.yaml), where the long
+# e2e suite under //tests has no headroom left: v44.0.0 died on
 # "//tests:e2e_test TIMEOUT in 3600.0s" and published nothing. Per-size timeouts
 # are there to catch hangs on PRs, where each suite gets its own runner and an
 # overrun means something is wrong. A release has no such signal to give, so the

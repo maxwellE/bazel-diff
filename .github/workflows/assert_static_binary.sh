@@ -2,7 +2,7 @@
 
 # Asserts that a published Linux binary is statically linked, i.e. that it
 # carries no dependency on the glibc of the runner that built it. Shared by the
-# `release-artifacts` job in ci.yaml (per-PR check) and the `rust-binaries` job
+# `release-artifacts` job in ci.yaml (per-PR check) and the `binaries` job
 # in release.yaml (before the asset is uploaded), so a regression cannot reach a
 # release without failing a PR first.
 #

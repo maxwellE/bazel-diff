@@ -27,11 +27,6 @@ jobs:
       matrix:
         bazel: [ '8.x', '9.x' ]
     steps:
-      - name: Setup Java JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'
       - name: Setup Go environment
         uses: actions/setup-go@v5
         with:

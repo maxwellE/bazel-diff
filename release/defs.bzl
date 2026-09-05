@@ -1,11 +1,15 @@
-"""Bazel-side naming for the Rust CLI binaries published to GitHub Releases.
+"""Bazel-side naming for the CLI binaries published to GitHub Releases.
 
-`bazel build //release:bazel-diff-rust --config=release` writes
+`bazel build //release:bazel-diff --config=release` writes
 `bazel-bin/release/bazel-diff-rust-<os>-<arch>[.exe]` for whatever platform Bazel
 is building for. Release automation therefore only has to run Bazel and upload
 what lands in `bazel-bin/release/`: no per-runner `cp`, no shell-side knowledge
 of where rules_rust drops the binary, and no way for the published asset name to
 disagree with the platform it was actually built on.
+
+The `bazel-diff-rust-` prefix predates the removal of the JVM CLI and is kept
+so the `releases/latest/download/bazel-diff-rust-<os>-<arch>` URLs users have
+scripted against keep resolving.
 """
 
 _OS_NAME = select(

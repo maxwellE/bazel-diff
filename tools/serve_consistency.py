@@ -5,20 +5,20 @@ Runs N `serve` instances side by side against one shared (mock) S3 cache tier an
 produce **the same hashes for the same commit**. If they do not, target hashes are carrying
 host-specific state, and every impacted-target answer the fleet gives is suspect.
 
-Nothing else in the repo can catch that. `E2ETest#testGenerateHashesIsHermeticAcrossWorkspacePaths`
-runs two hashes in one JVM on one machine; `serve_harness.py` drives a single instance. This
+Nothing else in the repo can catch that. `regressions::hashes_are_hermetic_across_workspace_paths`
+runs two hashes in one process on one machine; `serve_harness.py` drives a single instance. This
 harness is the first thing that runs several instances and compares what they each *wrote*.
 
 Why the S3 tier is the observation point
 ----------------------------------------
-`HashService.generate` writes the full `{label: hash}` map for a revision to the cache under
+The serve hash service writes the full `{label: hash}` map for a revision to the cache under
 `<sha>.<configFingerprint>` before returning. Intercepting those writes gives us, for one commit,
 N independently-computed hash maps -- so a failure names the exact targets that diverged rather
 than just reporting "the impacted set differed". `mock_s3.py` stands in for the bucket and records
 every request; it needs no container and no third-party dependency.
 
 Each instance always writes under its own `--s3Prefix` (`i0/`, `i1/`, ...) so writes stay
-attributable. `--s3Prefix` is deliberately *not* part of `ServeCommand.computeConfigFingerprint()`,
+attributable. `--s3Prefix` is deliberately *not* part of the serve config fingerprint,
 so the instances still agree on the cache key. The mock's read mode then decides what they can see:
 
   * isolated -- everyone generates independently. This is the poisoning detector.
@@ -32,7 +32,7 @@ compare):
 
   * clone paths of different lengths -- Bazel's output base is `_bazel_<user>/<md5 of the workspace
     path>`, so this genuinely gives each instance a different output base and its own Bazel server.
-    That is the lever for the highest-risk leak: `RuleHasher.ruleBzlSeed` filters macro
+    That is the lever for the highest-risk leak: the rule `.bzl` seed filters macro
     instantiation-stack frames only by an `external/` / `@` / `../` prefix, so an absolute `.bzl`
     frame would be hashed verbatim -- output base and all.
   * `HOME` / `TMPDIR` / `USER` (opt-in, `--env-skew`).
@@ -52,7 +52,7 @@ Exit code is non-zero if any gating check fails. Requires git (with `git daemon`
 binary. Pure Python stdlib, no third-party deps.
 
 Run it directly (`python3 tools/serve_consistency.py`), never via `bazel run` -- it shells out to
-`bazel build //cli:bazel-diff` and nested bazel deadlocks on the output-base lock. See tools/BUILD.
+`bazel build //src:bazel-diff` and nested bazel deadlocks on the output-base lock. See tools/BUILD.
 """
 
 from __future__ import annotations
@@ -201,7 +201,7 @@ class Instance:
 def decode_payload(body: bytes):
     """Parses a cached hash entry into (hashes, module_graph_json, dep_edges).
 
-    `HashService.serialize` emits one of two shapes: a bare `{label: hash}` object when there is no
+    the serve hash serializer emits one of two shapes: a bare `{label: hash}` object when there is no
     metadata, or `{"hashes": {...}, "metadata": {"moduleGraphJson": ..., "depEdges": {...}}}` when
     there is. Labels always start with `//` or `@`, so the `"hashes"` key cannot be ambiguous.
     """
@@ -265,7 +265,7 @@ class Divergence:
 def compare_payloads(bodies: dict, *, max_labels: int = 20) -> Divergence:
     """Compares the cache payloads [bodies] (instance id -> bytes) written for one key.
 
-    Compares *semantically*, not byte-wise. `HashService.serialize` gsons a `HashMap` produced by
+    Compares *semantically*, not byte-wise. the serve hash serializer writes a map produced by
     `Collectors.toMap` over a parallel stream, so JSON key order depends on how the ForkJoinPool
     happened to split the work -- i.e. on the host's CPU count. Two hosts can legitimately emit the
     same hashes in a different order. Byte-identity is still recorded (`byte_identical` /
@@ -767,7 +767,7 @@ def case_negative_control(ctx: Ctx) -> None:
 
     `--seed-filepaths` is hashed into every target
     (`BuildGraphHasher.createSeedForFilepaths`) but is absent from
-    `ServeCommand.computeConfigFingerprint()`, so giving one instance a different seed file changes
+    the serve config fingerprint, so giving one instance a different seed file changes
     all of its hashes while leaving the cache key untouched -- exactly the shape of a real
     poisoning bug, and a genuine product observation in its own right (see the INFO row).
     """
@@ -800,7 +800,7 @@ def case_negative_control(ctx: Ctx) -> None:
             "seedFilepaths is absent from the config fingerprint",
             base.INFO,
             "instances with different --seed-filepaths share a cache key while producing "
-            "different hashes (ServeCommand.computeConfigFingerprint)",
+            "different hashes (the serve config fingerprint)",
         )
     _shutdown(ctx, instances)
 
@@ -889,7 +889,7 @@ def case_shared(ctx: Ctx) -> None:
 def case_concurrent(ctx: Ctx) -> None:
     """All instances race the same cold revision pair against one shared bucket.
 
-    Cross-process generation is unlocked by design (`HashService.generationLock` is per-JVM), so
+    Cross-process generation is unlocked by design (the generation lock is per-process), so
     several instances generating the same key is expected and benign. Divergent *content* under one
     key is the bug.
     """
@@ -1266,8 +1266,8 @@ def main() -> int:
         return 2
 
     if not args.skip_build:
-        base.log(f"{base.C.BOLD}Building //cli:bazel-diff ...{base.C.RESET}")
-        base.run([base.BAZEL, "build", "//cli:bazel-diff"], cwd=base.REPO_ROOT)
+        base.log(f"{base.C.BOLD}Building //src:bazel-diff ...{base.C.RESET}")
+        base.run([base.BAZEL, "build", "//src:bazel-diff"], cwd=base.REPO_ROOT)
     if not base.LAUNCHER.exists():
         base.log(f"{base.C.RED}launcher not found at {base.LAUNCHER}; drop --skip-build{base.C.RESET}")
         return 2

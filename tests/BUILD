@@ -2,11 +2,10 @@ load("@bazel_diff_crates//:defs.bzl", "all_crate_deps")
 load("//tools/e2e:defs.bzl", "rust_e2e_tests")
 load("//tools/e2e:rust_e2e_cases.bzl", "RUST_E2E_SUITES")
 
-# The Rust behavioral suite, the Bazel equivalent of `cargo test --test e2e`.
-# It drives the real `bazel-diff` binary against real Bazel workspaces, so it is
-# an integration test in the same sense as //cli:E2ETest: it shells out to a
-# nested `bazel` (see `env_inherit` below), copies fixture workspaces into
-# $TEST_TMPDIR, and builds them.
+# The behavioral suite, the Bazel equivalent of `cargo test --test e2e`. It
+# drives the real `bazel-diff` binary against real Bazel workspaces, so it is an
+# integration test: it shells out to a nested `bazel` (see `env_inherit` below),
+# copies fixture workspaces into $TEST_TMPDIR, and builds them.
 #
 # One Bazel target per `#[test]` fn rather than one for the crate: the suite used
 # to be a single size = "enormous" target, so no individual case had a runtime
@@ -34,7 +33,7 @@ rust_e2e_tests(
     ]),
     crate_root = "e2e.rs",
     data = [
-        "//cli:e2e_resources",
+        ":e2e_resources",
         "//src:bazel-diff",
     ],
     edition = "2021",
@@ -52,6 +51,8 @@ rust_e2e_tests(
         # USE_BAZEL_VERSION names. Several fixtures are version-sensitive.
         "BAZEL",
         "HOME",
+        # Several fixture workspaces contain Java/proto targets, so the nested
+        # Bazel needs a JDK even though bazel-diff itself does not.
         "JAVA_HOME",
         "PATH",
         "USE_BAZEL_VERSION",
@@ -73,9 +74,9 @@ rust_e2e_tests(
     ),
 )
 
-# The Rust e2e sources //tools/e2e:regen_check re-derives the generated case
-# list from -- the crate root included, since the generator checks that every
-# module holding a `#[test]` is declared there.
+# The e2e sources //tools/e2e:regen_check re-derives the generated case list
+# from -- the crate root included, since the generator checks that every module
+# holding a `#[test]` is declared there.
 filegroup(
     name = "e2e_test_sources",
     srcs = glob([
@@ -83,4 +84,17 @@ filegroup(
         "e2e/**/*.rs",
     ]),
     visibility = ["//tools/e2e:__pkg__"],
+)
+
+# The suite reads both fixture trees straight off disk and resolves them
+# relative to the runfiles root (see support::repo_root()): zipped Bazel
+# workspaces plus their golden impacted-target lists under fixture/, and
+# checked-in workspaces under workspaces/ (listed in .bazelignore so the outer
+# Bazel never tries to load them as packages of this repo).
+filegroup(
+    name = "e2e_resources",
+    srcs = [
+        "resources/fixture",
+        "resources/workspaces",
+    ],
 )

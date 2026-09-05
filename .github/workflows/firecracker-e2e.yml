@@ -49,12 +49,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Java JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'
-
       - name: Setup Go environment
         uses: actions/setup-go@v5
         with:
@@ -82,11 +76,13 @@ jobs:
           sudo chmod 666 /dev/kvm
           ls -l /dev/kvm
 
-      - name: Build bazel-diff (deploy jar + launcher)
+      # One static musl binary serves both the host (local-driver baseline) and
+      # the guest image: it has no runtime dependencies on either side.
+      - name: Build bazel-diff (static musl binary)
         run: |
-          ~/go/bin/bazelisk build //cli:bazel-diff_deploy.jar
-          ~/go/bin/bazelisk run //:bazel-diff --script_path=/tmp/bazel_diff
-          ls -l bazel-bin/cli/bazel-diff_deploy.jar /tmp/bazel_diff
+          ~/go/bin/bazelisk build //release:bazel-diff --config=release-musl
+          install -m755 bazel-bin/release/bazel-diff-rust-linux-amd64 /tmp/bazel_diff
+          ls -l /tmp/bazel_diff
 
       - name: Build + unit-test the orchestrator
         working-directory: tools/firecracker
@@ -131,7 +127,7 @@ jobs:
         run: |
           sudo -E env \
             ARCH="$ARCH" KERNEL_VER="$KERNEL_VER" OUT="$IMG" SIZE_MB="$SIZE_MB" \
-            BAZEL_DIFF_JAR="$PWD/bazel-bin/cli/bazel-diff_deploy.jar" \
+            BAZEL_DIFF_BIN=/tmp/bazel_diff \
             BAZEL_BIN="${{ steps.bazel.outputs.bin }}" \
             WORKSPACE_SRC="$WS" SSH_PUBKEY=/tmp/fc_guest.pub \
             tools/firecracker/bench/build_guest_image.sh
