@@ -8,7 +8,7 @@ on:
 
 jobs:
   # Every Rust check here runs through Bazel, with no cargo and no host Rust
-  # toolchain: rules_rust downloads the compiler pinned in MODULE.bazel, so CI
+  # toolchain: rules_rs downloads the compiler pinned in MODULE.bazel, so CI
   # and a local `bazel test` agree on the exact rustc. //:rust_clippy_check and
   # //:rust_format_check below stand in for `cargo clippy -- -D warnings` and
   # `cargo fmt --all -- --check`.
@@ -113,7 +113,7 @@ jobs:
           USE_BAZEL_VERSION: '8.x'
         run: |
           ~/go/bin/bazelisk build //src:bazel-diff \
-            --extra_toolchains=@rust_toolchains//:rust_msrv__x86_64-unknown-linux-gnu__stable \
+            --extra_toolchains=@rust_msrv//rustc:all \
             --output_groups=-clippy_checks,-rustfmt_checks \
             --enable_bzlmod=true --enable_workspace=false
 

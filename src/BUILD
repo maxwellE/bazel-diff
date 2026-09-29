@@ -1,7 +1,9 @@
-load("@bazel_diff_crates//:defs.bzl", "all_crate_deps")
-load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("@rules_rs//rs:cargo_build_script.bzl", "cargo_build_script")
+load("@rules_rs//rs:rust_binary.bzl", "rust_binary")
+load("@rules_rs//rs:rust_library.bzl", "rust_library")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
 load("//tools/coverage:defs.bzl", "coverage_enforced_test")
+load(":crate_deps.bzl", "BUILD_DEPS", "CRATE_DEPS")
 
 cargo_build_script(
     name = "build_script",
@@ -17,10 +19,7 @@ cargo_build_script(
         "//:rust/proto/build.proto",
     ],
     tools = ["@protobuf//:protoc"],
-    deps = all_crate_deps(
-        package_name = "",
-        build = True,
-    ),
+    deps = BUILD_DEPS,
 )
 
 rust_library(
@@ -36,10 +35,7 @@ rust_library(
     },
     # //:rust_clippy_check and //:rust_format_check name this crate directly.
     visibility = ["//:__pkg__"],
-    deps = all_crate_deps(
-        package_name = "",
-        normal = True,
-    ) + [":build_script"],
+    deps = CRATE_DEPS + [":build_script"],
 )
 
 rust_binary(
@@ -50,10 +46,7 @@ rust_binary(
         "CARGO_PKG_VERSION": module_version() if module_version() else "unknown",
     },
     visibility = ["//visibility:public"],
-    deps = all_crate_deps(
-        package_name = "",
-        normal = True,
-    ) + [":bazel_diff_lib"],
+    deps = CRATE_DEPS + [":bazel_diff_lib"],
 )
 
 coverage_enforced_test(

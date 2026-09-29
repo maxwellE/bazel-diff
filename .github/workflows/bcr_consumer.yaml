@@ -3,9 +3,10 @@ name: BCR consumer
 # The BCR presubmit's verify_targets tasks consume bazel-diff as a
 # *dependency* (non-root module) unpacked from the release source archive.
 # Regular CI only ever builds bazel-diff as the root module, which misses
-# failure modes specific to non-root consumption — e.g. crate_universe
-# refusing a from_cargo call without a shipped cargo-bazel lockfile (the
-# bazel-central-registry#10043 presubmit failure) — as well as files missing
+# failure modes specific to non-root consumption — e.g. (under the old
+# rules_rust crate_universe setup) a from_cargo call refused without a shipped
+# cargo-bazel lockfile, the bazel-central-registry#10043 presubmit failure — as
+# well as files missing
 # from the release archive altogether. This check packs the archive with the
 # same script release_prep.sh uses, then builds the BCR verify_targets from a
 # scratch consumer module that pulls bazel-diff in via archive_override.

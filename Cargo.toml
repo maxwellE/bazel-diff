@@ -30,7 +30,15 @@ walkdir = "2.5"
 
 [build-dependencies]
 buffa-build = "0.9.1"
-protoc-bin-vendored = "3.2"
+protoc-bin-vendored = { version = "3.2", optional = true }
+
+[features]
+default = ["vendored-protoc"]
+# Lets a plain `cargo build` find protoc without one on PATH. Bazel builds leave
+# it off and hand build.rs @protobuf//:protoc through $PROTOC instead: the
+# protoc-bin-vendored crates locate their binary through a CARGO_MANIFEST_DIR
+# baked into the compiled code, which rules_rs rejects as non-hermetic.
+vendored-protoc = ["dep:protoc-bin-vendored"]
 
 [dev-dependencies]
 zip = { version = "2.2", default-features = false, features = ["deflate"] }

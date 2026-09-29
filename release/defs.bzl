@@ -4,7 +4,7 @@
 `bazel-bin/release/bazel-diff-rust-<os>-<arch>[.exe]` for whatever platform Bazel
 is building for. Release automation therefore only has to run Bazel and upload
 what lands in `bazel-bin/release/`: no per-runner `cp`, no shell-side knowledge
-of where rules_rust drops the binary, and no way for the published asset name to
+of where rules_rs drops the binary, and no way for the published asset name to
 disagree with the platform it was actually built on.
 """
 

@@ -1,46 +1,13 @@
-# Platforms bazel-diff publishes release binaries for, and the constraint that
-# separates them from the platforms it is ordinarily built and tested on.
+# Platforms bazel-diff publishes release binaries for.
 #
-# Bazel has no built-in notion of which libc a platform uses, and neither does
-# rules_rust: `abi_to_constraints` in @rules_rust//rust/platform:triple_mappings
-# maps both x86_64-unknown-linux-gnu and x86_64-unknown-linux-musl to nothing
-# more than {os:linux, cpu:x86_64}. The setting below supplies that missing
-# vocabulary so a musl toolchain can be selected without the glibc one matching
-# too.
+# Bazel has no built-in notion of which libc a Linux platform uses. rules_rs
+# supplies one (@rules_rs//rs/platforms/constraints:linux_libc, glibc by
+# default), and its Rust toolchains key the x86_64/aarch64 musl target triples
+# off it. The musl C toolchain in MODULE.bazel is gated on the same constraint,
+# so neither the musl Rust std nor the musl cross-compiler can leak into an
+# ordinary (glibc) build.
 
 package(default_visibility = ["//visibility:public"])
-
-# `system_libc` is the default, so @platforms//host and every stock platform
-# satisfies it without declaring anything: only the musl platforms below opt out.
-constraint_setting(
-    name = "libc",
-    default_constraint_value = ":system_libc",
-)
-
-# Whatever libc the platform ships -- glibc on a normal Linux distribution, and
-# by extension the C runtime on macOS and Windows.
-constraint_value(
-    name = "system_libc",
-    constraint_setting = ":libc",
-)
-
-constraint_value(
-    name = "musl",
-    constraint_setting = ":libc",
-)
-
-# Toolchain gates. See the `rust.toolchain` / `rust.repository_set` tags in
-# MODULE.bazel, which use these to keep the glibc and musl Rust toolchains from
-# both matching the same build.
-config_setting(
-    name = "is_system_libc",
-    constraint_values = [":system_libc"],
-)
-
-config_setting(
-    name = "is_musl",
-    constraint_values = [":musl"],
-)
 
 # Platforms the published Linux binaries are built for:
 # `bazel build //release:bazel-diff-rust --config=release-musl` (amd64) and
@@ -53,7 +20,7 @@ platform(
     constraint_values = [
         "@platforms//cpu:x86_64",
         "@platforms//os:linux",
-        ":musl",
+        "@rules_rs//rs/platforms/constraints:musl",
     ],
 )
 
@@ -62,6 +29,6 @@ platform(
     constraint_values = [
         "@platforms//cpu:aarch64",
         "@platforms//os:linux",
-        ":musl",
+        "@rules_rs//rs/platforms/constraints:musl",
     ],
 )

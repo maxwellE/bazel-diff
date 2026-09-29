@@ -83,10 +83,17 @@ fn top_level_bazel_workspaces(root: &Path) -> Vec<PathBuf> {
 /// as runfiles, laid out under `$TEST_SRCDIR/$TEST_WORKSPACE` at the same
 /// repo-relative paths. Under `cargo test` there are no runfiles, so fall back
 /// to the crate directory, which is the repo root.
+///
+/// The crate directory is read at runtime (`cargo test` sets
+/// `CARGO_MANIFEST_DIR` for the test process too) rather than with `env!`, which
+/// would bake the absolute build directory into the binary -- something rules_rs
+/// refuses to compile, since it makes the output depend on where it was built.
 pub fn repo_root() -> PathBuf {
     match runfiles_root() {
         Some(root) => root,
-        None => PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        None => std::env::var_os("CARGO_MANIFEST_DIR")
+            .map(PathBuf::from)
+            .expect("run under `bazel test` (runfiles) or `cargo test` (CARGO_MANIFEST_DIR)"),
     }
 }
 
