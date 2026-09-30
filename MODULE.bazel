@@ -1,6 +1,9 @@
 module(
     name = "bazel-diff",
     version = "46.0.0",
+    # rules_rs (the Rust ruleset) uses the Starlark `set` type, which Bazel 7
+    # does not have.
+    bazel_compatibility = [">=8.0.0"],
     compatibility_level = 0,
 )
 
