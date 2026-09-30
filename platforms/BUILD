@@ -32,3 +32,13 @@ platform(
         "@rules_rs//rs/platforms/constraints:musl",
     ],
 )
+
+# Host platform for Windows builds (set in .bazelrc; BCR's Windows presubmit
+# passes it too). rules_rs selects Windows Rust toolchains by ABI, and the
+# autodetected host platform leaves the ABI unconstrained, so no
+# x86_64-pc-windows-msvc toolchain would match.
+platform(
+    name = "local_windows_msvc",
+    constraint_values = ["@llvm//constraints/windows/abi:msvc"],
+    parents = ["@platforms//host"],
+)

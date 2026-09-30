@@ -9,6 +9,10 @@ common --java_runtime_version=remotejdk_21
 # Enable platform-specific config
 common --enable_platform_specific_config
 
+# rules_rs picks Windows Rust toolchains by ABI, which the autodetected host
+# platform does not declare. See //platforms:local_windows_msvc.
+common:windows --host_platform=//platforms:local_windows_msvc
+
 # Set C++ standard to C++17 for abseil-cpp compatibility
 # Use GCC/Clang syntax for Linux and macOS
 build:linux --cxxopt=-std=c++17
