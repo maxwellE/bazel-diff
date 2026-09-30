@@ -25,7 +25,8 @@ This approach was inspired by the [following BazelConf talk](https://www.youtube
 ## Prerequisites
 
 * Git
-* Bazel 7 or higher (Bazel itself needs a JDK; `bazel-diff` is a single static binary and does not)
+* Bazel 7 or higher in the workspace being analyzed (Bazel itself needs a JDK; `bazel-diff` is a single static binary and does not)
+* Bazel 8 or higher to build `bazel-diff` from source or consume it as a Bazel module
 
 ## Getting Started
 

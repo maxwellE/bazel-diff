@@ -64,10 +64,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # bazel_startup_flags shortens the output root on Windows because MSVC's
-        # link.exe is MAX_PATH-bound (260): under the default root the Rust
-        # stdlib rlib ...\librustc_std_workspace_alloc-<hash>.rlib comes to 263
-        # characters and the link fails with LNK1181. Keep in sync with the
+        # bazel_startup_flags shortens the output base on Windows because MSVC's
+        # link.exe is MAX_PATH-bound (260): the Rust stdlib rlib
+        # ...\librustc_std_workspace_alloc-<hash>.rlib otherwise passes 259
+        # characters and the link fails with LNK1181 (the ci.yaml job spells
+        # out the budget). Keep in sync with the
         # `release-artifacts` job in ci.yaml, which is where this gets exercised
         # per-PR -- including release_config, which builds the Linux assets
         # statically against musl so they run on any distribution rather than
@@ -93,7 +94,7 @@ jobs:
           - os: windows-latest
             asset: bazel-diff-rust-windows-amd64.exe
             release_config: release
-            bazel_startup_flags: "--output_user_root=C:/b"
+            bazel_startup_flags: "--output_base=C:/o"
             bazel_extra_flags: "--legacy_external_runfiles"
     steps:
       - name: Checkout
