@@ -19,7 +19,7 @@ lint gates in //BUILD a single crate to check instead of one per case.
 """
 
 load("@rules_kotlin//kotlin:jvm.bzl", "kt_jvm_test")
-load("@rules_rust//rust:defs.bzl", "rust_test")
+load("@rules_rs//rs:rust_test.bzl", "rust_test")
 
 # Backslash first: escaping it after the others would double-escape the
 # backslashes they just inserted.

@@ -9,6 +9,10 @@ common --java_runtime_version=remotejdk_21
 # Enable platform-specific config
 common --enable_platform_specific_config
 
+# rules_rs picks Windows Rust toolchains by ABI, which the autodetected host
+# platform does not declare. See //platforms:local_windows_msvc.
+common:windows --host_platform=//platforms:local_windows_msvc
+
 # Set C++ standard to C++17 for abseil-cpp compatibility
 # Use GCC/Clang syntax for Linux and macOS
 build:linux --cxxopt=-std=c++17
@@ -24,7 +28,7 @@ build:windows --host_cxxopt=/std:c++17
 # live here rather than in the workflow files. The C++ standard flags come from
 # the platform-specific configs above.
 #
-# rules_rust ignores Cargo profiles, so `-c opt` alone (opt-level=3,
+# rules_rs (like the rules_rust it builds on) ignores Cargo profiles, so `-c opt` alone (opt-level=3,
 # debuginfo=0, strip=debuginfo) builds a *weaker* binary than
 # `cargo build --release` does under [profile.release] in Cargo.toml. The two
 # settings below restore the difference; keep them in sync with that profile.
@@ -58,7 +62,7 @@ common --incompatible_strict_action_env
 common --test_env=PATH
 
 # Lint and format-check first-party Rust crates on every build so issues surface
-# immediately. Both aspects only attach to rules_rust targets (required_providers
+# immediately. Both aspects only attach to Rust targets (required_providers
 # gates them) and skip external crates. Opt a target out with
 # tags = ["no-clippy"] / tags = ["no-rustfmt"].
 #

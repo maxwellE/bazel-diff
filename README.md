@@ -25,7 +25,8 @@ This approach was inspired by the [following BazelConf talk](https://www.youtube
 ## Prerequisites
 
 * Git
-* Bazel 3.3.0 or higher
+* Bazel 3.3.0 or higher in the workspace being analyzed
+* Bazel 8.0 or higher to build `bazel-diff` from source or consume it as a Bazel module
 * Java 8 JDK or higher (Bazel requires this)
 
 ## Getting Started

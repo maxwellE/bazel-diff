@@ -8,7 +8,7 @@ on:
 
 jobs:
   # Every Rust check here runs through Bazel, with no cargo and no host Rust
-  # toolchain: rules_rust downloads the compiler pinned in MODULE.bazel, so CI
+  # toolchain: rules_rs downloads the compiler pinned in MODULE.bazel, so CI
   # and a local `bazel test` agree on the exact rustc. //:rust_clippy_check and
   # //:rust_format_check below stand in for `cargo clippy -- -D warnings` and
   # `cargo fmt --all -- --check`.
@@ -113,7 +113,7 @@ jobs:
           USE_BAZEL_VERSION: '8.x'
         run: |
           ~/go/bin/bazelisk build //src:bazel-diff \
-            --extra_toolchains=@rust_toolchains//:rust_msrv__x86_64-unknown-linux-gnu__stable \
+            --extra_toolchains=@rust_msrv//rustc:all \
             --output_groups=-clippy_checks,-rustfmt_checks \
             --enable_bzlmod=true --enable_workspace=false
 
@@ -222,14 +222,6 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            bazel: '7.x'
-            disable_workspace: 'false'
-            extra_flags: ''
-          - os: ubuntu-latest
-            bazel: '7.x'
-            disable_workspace: 'false'
-            extra_flags: '--incompatible_disable_native_repo_rules'
-          - os: ubuntu-latest
             bazel: '8.x'
             disable_workspace: 'true'
             extra_flags: ''
@@ -249,8 +241,6 @@ jobs:
             bazel: '9.x'
             disable_workspace: 'true'
             extra_flags: '--incompatible_disable_native_repo_rules'
-          # Skip Windows + Bazel 7.x due to protobuf compilation issues on MSVC
-          # Windows is tested with Bazel 8.x and 9.x which are more current
           - os: windows-latest
             bazel: '8.x'
             disable_workspace: 'true'
@@ -330,11 +320,16 @@ jobs:
         # The two Windows-only Bazel flags can't move into --config=release:
         # startup flags can't live in a --config at all, and .bazelrc expands
         # platform-specific config for the bare `build` config name only.
-        # bazel_startup_flags shortens the output root because MSVC's link.exe
-        # is MAX_PATH-bound (260): under the default root, the Rust stdlib path
-        # ...rust_toolchain\lib\rustlib\x86_64-pc-windows-msvc\lib\
-        # librustc_std_workspace_alloc-<hash>.rlib comes to 263 characters and
-        # the link fails with LNK1181. C:/b buys back 35.
+        # bazel_startup_flags shortens the output base because MSVC's link.exe
+        # is MAX_PATH-bound (260). The longest path the link reads is the
+        # bootstrap Rust toolchain's stdlib, C:\o\execroot\_main\bazel-out\
+        # x64_windows-opt-exec-ST-<hash>\bin\external\rules_rs++toolchains+rs\
+        # rustc\default_windows_x86_64_1_90_0_rust_toolchain_bootstrap\lib\
+        # rustlib\x86_64-pc-windows-msvc\lib\
+        # librustc_std_workspace_alloc-<hash>.rlib: 254 characters. Past 259
+        # the link fails with LNK1181, so keep both this and the short `rs`
+        # toolchain repo name in MODULE.bazel. --output_base (rather than
+        # --output_user_root) also drops the per-workspace hash directory.
         #
         # release_config is `release-musl` on Linux: the published Linux amd64
         # binary is statically linked against musl so it does not inherit the
@@ -363,7 +358,7 @@ jobs:
             java: '11'
             rust_asset: bazel-diff-rust-windows-amd64.exe
             release_config: release
-            bazel_startup_flags: '--output_user_root=C:/b'
+            bazel_startup_flags: '--output_base=C:/o'
             bazel_extra_flags: '--legacy_external_runfiles'
             upload_jar_and_archive: false
     steps:

@@ -1,6 +1,5 @@
 matrix:
   bazel:
-  - 7.x
   - 8.x
   - 9.x
 tasks:
@@ -40,6 +39,7 @@ tasks:
     bazel: "8.x"
     build_flags:
     - '--legacy_external_runfiles'
+    - '--host_platform=@bazel-diff//platforms:local_windows_msvc'
     - '--cxxopt=-std=c++17'
     - '--host_cxxopt=-std=c++17'
     build_targets:
@@ -51,6 +51,7 @@ tasks:
     bazel: "9.x"
     build_flags:
     - '--legacy_external_runfiles'
+    - '--host_platform=@bazel-diff//platforms:local_windows_msvc'
     - '--cxxopt=-std=c++17'
     - '--host_cxxopt=-std=c++17'
     build_targets:
