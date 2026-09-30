@@ -96,7 +96,14 @@ toolchains = use_extension("@rules_rs//rs/toolchains:module_extension.bzl", "too
 # including the x86_64/aarch64 musl targets the Linux release binaries are
 # built for (see //platforms), which rules_rs tells apart from glibc with its
 # own libc constraint. No per-target `repository_set` plumbing is needed.
+#
+# Named `rs` rather than rules_rs's default `default_rust_toolchains` because
+# the name is part of every stdlib path on Windows, where MSVC's link.exe is
+# MAX_PATH-bound (see `release-artifacts` in .github/workflows/ci.yaml): the
+# longer name alone pushes the bootstrap toolchain's
+# librustc_std_workspace_alloc-<hash>.rlib past 260 characters.
 toolchains.toolchain(
+    name = "rs",
     edition = "2021",
     version = "1.90.0",
 )
@@ -113,9 +120,9 @@ toolchains.toolchain(
     edition = "2021",
     version = "1.85.0",
 )
-use_repo(toolchains, "default_rust_toolchains", "rust_msrv")
+use_repo(toolchains, "rs", "rust_msrv")
 
-register_toolchains("@default_rust_toolchains//...")
+register_toolchains("@rs//...")
 
 # C toolchain for the musl target: a gcc cross-compiler bundled with musl libc,
 # used to link the Rust binary and to build the C in `ring` (rustls). Scoped to

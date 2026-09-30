@@ -320,11 +320,16 @@ jobs:
         # The two Windows-only Bazel flags can't move into --config=release:
         # startup flags can't live in a --config at all, and .bazelrc expands
         # platform-specific config for the bare `build` config name only.
-        # bazel_startup_flags shortens the output root because MSVC's link.exe
-        # is MAX_PATH-bound (260): under the default root, the Rust stdlib path
-        # ...rust_toolchain\lib\rustlib\x86_64-pc-windows-msvc\lib\
-        # librustc_std_workspace_alloc-<hash>.rlib comes to 263 characters and
-        # the link fails with LNK1181. C:/b buys back 35.
+        # bazel_startup_flags shortens the output base because MSVC's link.exe
+        # is MAX_PATH-bound (260). The longest path the link reads is the
+        # bootstrap Rust toolchain's stdlib, C:\o\execroot\_main\bazel-out\
+        # x64_windows-opt-exec-ST-<hash>\bin\external\rules_rs++toolchains+rs\
+        # rustc\default_windows_x86_64_1_90_0_rust_toolchain_bootstrap\lib\
+        # rustlib\x86_64-pc-windows-msvc\lib\
+        # librustc_std_workspace_alloc-<hash>.rlib: 254 characters. Past 259
+        # the link fails with LNK1181, so keep both this and the short `rs`
+        # toolchain repo name in MODULE.bazel. --output_base (rather than
+        # --output_user_root) also drops the per-workspace hash directory.
         #
         # release_config is `release-musl` on Linux: the published Linux amd64
         # binary is statically linked against musl so it does not inherit the
@@ -353,7 +358,7 @@ jobs:
             java: '11'
             rust_asset: bazel-diff-rust-windows-amd64.exe
             release_config: release
-            bazel_startup_flags: '--output_user_root=C:/b'
+            bazel_startup_flags: '--output_base=C:/o'
             bazel_extra_flags: '--legacy_external_runfiles'
             upload_jar_and_archive: false
     steps:
