@@ -17,7 +17,10 @@ dependency edges are the only ones hashed.
 | `//:app` (bootstrap=true)| none        |
 
 `bazel cquery 'deps(//:app)'` therefore lists `//:app` twice. The configured
-graph is acyclic.
+graph is acyclic. The unconfigured graph is not: plain `bazel query` sees every
+branch of the `select()`, so `app -> helper -> app` is a real cycle there and
+`generate-hashes` without `--useCquery` reports it. This fixture is only
+meaningful under `--useCquery`.
 
 ## Expected behaviour
 
