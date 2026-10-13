@@ -494,6 +494,21 @@ class BuildGraphHasherTest : KoinTest {
     assertThat(hash.getValue("//:helper").deps).isEqualTo(listOf("//:app"))
   }
 
+  // A generated file names its generating rule in the file's own configuration; when that
+  // instance is not in the graph, the file resolves to another instance of the rule's label.
+  @Test
+  fun generatedFileResolvesToAnotherInstanceOfItsGeneratingRule() = runBlocking {
+    declareMock<Logger>()
+    val gen = createRuleTarget(name = "//:gen|aa", inputs = ArrayList(), digest = "gen")
+    val out = createGeneratedTarget(name = "//:out|cc", generatingRuleName = "//:gen|cc")
+    whenever(bazelClientMock.queryAllTargets()).thenReturn(listOf(gen, out))
+
+    val hash = hasher.hashAllBazelTargetsAndSourcefiles()
+
+    assertThat(hash.keys).containsOnly("//:gen", "//:out")
+    assertThat(hash.getValue("//:out").deps).isEqualTo(listOf("//:gen"))
+  }
+
   private fun createRuleTarget(
       name: String,
       inputs: List<String>,

@@ -510,6 +510,37 @@ class BazelRuleTest {
     assertThat(a.digest(emptySet())).isNotEqualTo(b.digest(emptySet()))
   }
 
+  // Tinder/bazel-diff#512: configured targets are named `label|checksum`, the same encoding as
+  // configured rule inputs, and the bare label is what the hash file is keyed by.
+  @Test
+  fun testConfiguredTargetNameRoundTripsThroughDecode() {
+    val name = configuredTargetName("//:app", "cfg-A")
+
+    assertThat(name).isEqualTo("//:app|cfg-A")
+    assertThat(decodeConfiguredRuleInputLabel(name)).isEqualTo("//:app")
+  }
+
+  @Test
+  fun testConfiguredLabelInstancesGroupsConfiguredNamesByLabel() {
+    val instances =
+        configuredLabelInstances(listOf("//:app|cfg-B", "//:bare", "//:app|cfg-A", "//:lib|cfg-A"))
+
+    assertThat(instances)
+        .isEqualTo(
+            mapOf(
+                "//:app" to listOf("//:app|cfg-A", "//:app|cfg-B"),
+                "//:lib" to listOf("//:lib|cfg-A")))
+  }
+
+  @Test
+  fun testDigestIgnoresConfigurationInName() {
+    val bare = Rule.newBuilder().setRuleClass("java_library").setName("//:lib").build()
+    val configured = Rule.newBuilder().setRuleClass("java_library").setName("//:lib|cfg-A").build()
+
+    assertThat(BazelRule(configured).digest(emptySet()))
+        .isEqualTo(BazelRule(bare).digest(emptySet()))
+  }
+
   private fun configuredGenrule(depLabel: String, configurationChecksum: String): Rule {
     return Rule.newBuilder()
         .setRuleClass("genrule")
