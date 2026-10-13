@@ -474,6 +474,26 @@ class BuildGraphHasherTest : KoinTest {
     assertThat(hash.containsKey("//pkg:lib")).isEqualTo(true)
   }
 
+  // Tinder/bazel-diff#512: two configured instances of //:app, named by their configuration, are
+  // two nodes while hashing and one label in the result, whose edges are the union of theirs.
+  @Test
+  fun configuredInstancesAggregateToTheirLabel() = runBlocking {
+    declareMock<Logger>()
+    val appDefault =
+        createRuleTarget(name = "//:app|aa", inputs = arrayListOf("//:helper|aa"), digest = "app")
+    val appBootstrap = createRuleTarget(name = "//:app|bb", inputs = ArrayList(), digest = "app")
+    val helper =
+        createRuleTarget(
+            name = "//:helper|aa", inputs = arrayListOf("//:app|bb"), digest = "helper")
+    whenever(bazelClientMock.queryAllTargets()).thenReturn(listOf(appDefault, appBootstrap, helper))
+
+    val hash = hasher.hashAllBazelTargetsAndSourcefiles()
+
+    assertThat(hash.keys).containsOnly("//:app", "//:helper")
+    assertThat(hash.getValue("//:app").deps).isEqualTo(listOf("//:helper"))
+    assertThat(hash.getValue("//:helper").deps).isEqualTo(listOf("//:app"))
+  }
+
   private fun createRuleTarget(
       name: String,
       inputs: List<String>,

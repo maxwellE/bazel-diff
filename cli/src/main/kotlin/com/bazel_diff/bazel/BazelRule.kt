@@ -11,13 +11,18 @@ import com.google.devtools.build.lib.query2.proto.proto2api.Build
 // https://github.com/bazelbuild/bazel/blob/6971b016f1e258e3bb567a0f9fe7a88ad565d8f2/src/main/java/com/google/devtools/build/lib/query2/query/output/SyntheticAttributeHashCalculator.java#L78-L81
 private val DEFAULT_IGNORED_ATTRS = arrayOf("generator_location")
 
-// Separator used to fold a cquery dep-edge's `configurationChecksum` into a rule-input string.
-// Bazel target/package names are restricted to `[A-Za-z0-9/._+=,@~-]*` plus `:` between package
-// and target, so `|` is invalid in a label and is a safe in-band encoding that survives the
-// existing `List<String>` return type of `ruleInputList()`. `RuleHasher` splits on this character
-// to recover the bare label for `allRulesMap` / `sourceDigests` lookups and dep tracking; the
-// full encoded string is what gets mixed into the transitive hash, so two configured graphs that
-// share dep labels but differ in per-edge configuration produce distinct rule digests. See #359.
+// Separator between a label and the checksum of the configuration it was analyzed in.
+//
+// A cquery graph is a graph of *configured* targets: one label can be analyzed in several
+// configurations (a transition, an exec dependency, a `select()` that resolves differently), and
+// those instances have different dependencies. Bazel identifies each dependency edge by
+// `(label, configuration checksum)` in `configuredRuleInput`, which [encodeConfiguredRuleInput]
+// folds into `label|checksum` (#359). [BazelQueryService] names configured rules and generated
+// files the same way, so an edge resolves to the instance it points at rather than to whichever
+// instance of the label came first: collapsing by label lost edges and, when an instance depended
+// on the same label in another configuration, reported a cycle the configured graph does not have
+// (Tinder/bazel-diff#512). The full encoded string is what gets mixed into a rule's digest; the
+// bare label, via [decodeConfiguredRuleInputLabel], is what the hash file is keyed by.
 const val CONFIGURED_RULE_INPUT_SEPARATOR: Char = '|'
 
 fun encodeConfiguredRuleInput(input: Build.ConfiguredRuleInput): String {
@@ -25,12 +30,12 @@ fun encodeConfiguredRuleInput(input: Build.ConfiguredRuleInput): String {
   // for the known Bazel quirk where cquery's `transitions=lite` output sometimes omits the
   // configurationChecksum for an edge, and avoids appending a dangling separator.
   val checksum = input.configurationChecksum
-  return if (checksum.isNullOrEmpty()) {
-    input.label
-  } else {
-    "${input.label}${CONFIGURED_RULE_INPUT_SEPARATOR}${checksum}"
-  }
+  return if (checksum.isNullOrEmpty()) input.label else configuredTargetName(input.label, checksum)
 }
+
+/** Names a configured target by its label and the checksum of its configuration. */
+fun configuredTargetName(label: String, checksum: String): String =
+    "$label$CONFIGURED_RULE_INPUT_SEPARATOR$checksum"
 
 fun decodeConfiguredRuleInputLabel(encoded: String): String {
   // No separator present -> the input is a bare label (non-cquery callers, empty-checksum
@@ -38,11 +43,28 @@ fun decodeConfiguredRuleInputLabel(encoded: String): String {
   return encoded.substringBefore(CONFIGURED_RULE_INPUT_SEPARATOR)
 }
 
+/**
+ * The names in [names] that carry a configuration checksum, grouped by their bare label and sorted:
+ * the fallback for an edge that names a configured instance absent from the graph. Empty for a
+ * plain query, where every name is a bare label.
+ */
+fun configuredLabelInstances(names: Collection<String>): Map<String, List<String>> {
+  val instances = HashMap<String, MutableList<String>>()
+  for (name in names) {
+    val label = decodeConfiguredRuleInputLabel(name)
+    if (label != name) instances.getOrPut(label) { mutableListOf() }.add(name)
+  }
+  instances.values.forEach { it.sort() }
+  return instances
+}
+
 class BazelRule(private val rule: Build.Rule) {
   fun digest(ignoredAttrs: Set<String>): ByteArray {
     return sha256 {
       safePutBytes(rule.ruleClassBytes.toByteArray())
-      safePutBytes(rule.nameBytes.toByteArray())
+      // The bare label: a configured instance's definition digest does not depend on which
+      // configuration it was analyzed in, so a label hashed once keeps its pre-#512 digest.
+      safePutBytes(decodeConfiguredRuleInputLabel(rule.name).toByteArray())
       safePutBytes(rule.skylarkEnvironmentHashCodeBytes.toByteArray())
       // Hash attributes in a canonical (name-sorted) order so a rule's digest is invariant to the
       // order Bazel happens to emit them in. Attribute names are unique within a rule (the proto

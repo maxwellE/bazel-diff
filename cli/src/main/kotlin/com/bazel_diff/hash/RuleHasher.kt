@@ -112,7 +112,7 @@ class RuleHasher(
           // resolves its own seed, so this is stable under the memoized recursion below (#365).
           putDirectBytes(
               ruleBzlSeed(rule, modifiedFilepaths, hashInvocationContext)
-                  ?: packageBzlSeeds[labelToPackage(rule.name)])
+                  ?: packageBzlSeeds[labelToPackage(decodeConfiguredRuleInputLabel(rule.name))])
           // Mixed into the *direct* digest (not transitively) so the tagged target is classified
           // as DIRECT-impacted for distance metrics; it still bubbles into the overall digest, so
           // any rdeps are conservatively re-hashed too.
@@ -124,12 +124,16 @@ class RuleHasher(
             // Under --useCquery, `ruleInput` may carry an embedded configurationChecksum (see
             // BazelRule.CONFIGURED_RULE_INPUT_SEPARATOR / #359). The full encoded string is what
             // we mix into the hash so two configured graphs differing only by per-edge
-            // configuration produce distinct digests; the bare label is what we use to look up
-            // the input in `allRulesMap` / `sourceDigests` and to track in `deps`.
+            // configuration produce distinct digests, and it names the configured instance the
+            // edge points at (see resolveInputRule); the bare label is what we use to look up
+            // the input in `sourceDigests`.
             putDirectBytes(ruleInput.toByteArray())
             val inputLabel = decodeConfiguredRuleInputLabel(ruleInput)
 
-            val inputRule = allRulesMap[inputLabel]
+            val inputKey =
+                resolveInputKey(
+                    ruleInput, inputLabel, allRulesMap, depPathClone, hashInvocationContext)
+            val inputRule = inputKey?.let { allRulesMap[it] }
             when {
               inputRule == null && sourceDigests.containsKey(inputLabel) -> {
                 putDirectBytes(sourceDigests[inputLabel])
@@ -147,7 +151,7 @@ class RuleHasher(
                         ignoredAttrs,
                         modifiedFilepaths,
                         hashInvocationContext)
-                putTransitiveBytes(inputLabel, ruleInputHash.overallDigest)
+                putTransitiveBytes(inputKey!!, ruleInputHash.overallDigest)
               }
               else -> {
                 val heuristicDigest =
@@ -182,7 +186,10 @@ class RuleHasher(
           if ("visibility" !in ignoredAttrs) {
             for (packageGroupLabel in rule.visibilityPackageGroupLabels()) {
               val packageGroup = allRulesMap[packageGroupLabel] ?: continue
-              if (!packageGroup.isPackageGroup || packageGroup.name == rule.name) continue
+              if (!packageGroup.isPackageGroup ||
+                  decodeConfiguredRuleInputLabel(packageGroup.name) ==
+                      decodeConfiguredRuleInputLabel(rule.name))
+                  continue
               putDirectBytes(packageGroupLabel.toByteArray())
               val packageGroupHash =
                   digest(
@@ -202,5 +209,28 @@ class RuleHasher(
         }
 
     return finalHashValue.also { ruleHashes[rule.name] = it }
+  }
+
+  /**
+   * The key in [allRulesMap] a rule input resolves to, or null when it names no rule or generated
+   * file in the graph. A configured input names the exact instance it points at; that instance is
+   * used when it is in the graph, and a bare label (every input of a plain query) resolves
+   * directly. Otherwise the edge falls back to a configured instance of the same label, which keeps
+   * edges to instances outside the query result resolving as they always have. The fallback never
+   * closes a cycle through the path being hashed: a configured graph Bazel analyzed has none, so
+   * such an edge points at an instance that is simply not in the result, and is dropped.
+   */
+  private fun resolveInputKey(
+      ruleInput: String,
+      inputLabel: String,
+      allRulesMap: Map<String, BazelRule>,
+      depPath: Set<String>,
+      hashInvocationContext: HashInvocationContext
+  ): String? {
+    if (ruleInput in allRulesMap) return ruleInput
+    if (inputLabel in allRulesMap) return inputLabel
+    val fallback =
+        hashInvocationContext.labelInstances(allRulesMap)[inputLabel]?.firstOrNull() ?: return null
+    return if (fallback in depPath) null else fallback
   }
 }

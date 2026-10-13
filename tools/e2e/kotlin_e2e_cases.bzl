@@ -171,6 +171,10 @@ KOTLIN_E2E_SUITES = [
                 "name": "testEditingCrossFileRuleImpactsConsumerNotSiblings",
                 "timeout": "moderate",
             },
+            {
+                "name": "testCqueryKeepsDependenciesOfEveryConfiguredInstance",
+                "timeout": "moderate",
+            },
         ],
     },
 ]

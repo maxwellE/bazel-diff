@@ -437,4 +437,36 @@ class RuleHasherTest : KoinTest {
     assertThat(a.overallDigest.toHexString()).isNotEqualTo(b.overallDigest.toHexString())
     assertThat(a.directDigest.toHexString()).isNotEqualTo(b.directDigest.toHexString())
   }
+
+  // Tinder/bazel-diff#512: under cquery a rule's name is its configured identity, and an edge
+  // names the instance it points at. `//:app` is analyzed twice: in the default configuration it
+  // depends on `//:helper`, which transitions it into a bootstrap configuration where it has no
+  // deps. Keyed by label, `//:helper`'s edge pointed back at the instance that depends on
+  // `//:helper`: a cycle only on paper.
+  @Test
+  fun configuredInstancesOfALabelAreDistinctNodes() {
+    val appDefault = rule("//:app|aa", configuredRuleInputs = listOf("//:helper" to "aa"))
+    val appBootstrap = rule("//:app|bb")
+    val helper = rule("//:helper|aa", configuredRuleInputs = listOf("//:app" to "bb"))
+    val rules = listOf(appDefault, appBootstrap, helper).associateBy { it.name }
+
+    val app = digest(hasher = hasher(useCquery = true), rule = appDefault, allRulesMap = rules)
+    assertThat(app.deps).isEqualTo(listOf("//:helper|aa"))
+
+    val helperDigest = digest(hasher = hasher(useCquery = true), rule = helper, allRulesMap = rules)
+    assertThat(helperDigest.deps).isEqualTo(listOf("//:app|bb"))
+  }
+
+  @Test
+  fun configuredInputOutsideTheGraphFallsBackToTheLabel() {
+    // //:lib's edge names an instance of //:tool that is not in the graph; it resolves to the
+    // instance that is. //:tool's edge back to an absent instance of //:lib would only resolve to
+    // the //:lib being hashed, so it is dropped rather than reported as a cycle.
+    val lib = rule("//:lib|aa", configuredRuleInputs = listOf("//:tool" to "cc"))
+    val tool = rule("//:tool|bb", configuredRuleInputs = listOf("//:lib" to "zz"))
+    val rules = listOf(lib, tool).associateBy { it.name }
+
+    val libDigest = digest(hasher = hasher(useCquery = true), rule = lib, allRulesMap = rules)
+    assertThat(libDigest.deps).isEqualTo(listOf("//:tool|bb"))
+  }
 }

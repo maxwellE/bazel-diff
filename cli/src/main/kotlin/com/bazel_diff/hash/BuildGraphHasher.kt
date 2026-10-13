@@ -5,9 +5,10 @@ import com.bazel_diff.bazel.BazelModService
 import com.bazel_diff.bazel.BazelRule
 import com.bazel_diff.bazel.BazelSourceFileTarget
 import com.bazel_diff.bazel.BazelTarget
+import com.bazel_diff.bazel.configuredLabelInstances
+import com.bazel_diff.bazel.decodeConfiguredRuleInputLabel
 import com.bazel_diff.extensions.toHexString
 import com.bazel_diff.log.Logger
-import com.google.common.collect.Sets
 import java.nio.file.Path
 import java.util.Calendar
 import java.util.concurrent.ConcurrentHashMap
@@ -141,62 +142,93 @@ class BuildGraphHasher(private val bazelClient: BazelClient) : KoinComponent {
     val targetToRule: MutableMap<String, BazelRule> = HashMap()
     traverseGraph(allTargets, targetToRule)
 
-    return allTargets
-        .parallelStream()
-        .map { target: BazelTarget ->
-          val targetDigest =
-              targetHasher.digest(
-                  target,
-                  targetToRule,
-                  sourceDigests,
-                  ruleHashes,
-                  seedHash,
-                  packageBzlSeeds,
-                  ignoredAttrs,
-                  modifiedFilepaths,
-                  hashInvocationContext)
-          Pair(
-              target.name,
-              TargetHash(
+    val digests =
+        allTargets
+            .parallelStream()
+            .map { target: BazelTarget ->
+              Triple(
+                  target.name,
                   target.javaClass.name.substringAfterLast('$'),
-                  targetDigest.overallDigest.toHexString(),
-                  targetDigest.directDigest.toHexString(),
-                  targetDigest.deps,
-              ))
-        }
-        .filter { targetEntry: Pair<String, TargetHash>? -> targetEntry != null }
-        .collect(
-            Collectors.toMap(
-                { obj: Pair<String, TargetHash> -> obj.first },
-                { obj: Pair<String, TargetHash> -> obj.second },
-            ))
+                  targetHasher.digest(
+                      target,
+                      targetToRule,
+                      sourceDigests,
+                      ruleHashes,
+                      seedHash,
+                      packageBzlSeeds,
+                      ignoredAttrs,
+                      modifiedFilepaths,
+                      hashInvocationContext))
+            }
+            .collect(Collectors.toList())
+    return aggregateByLabel(digests)
   }
 
-  /** Traverses the list of targets and revisits the targets with yet-unknown generating rule */
+  /**
+   * Folds per-name digests into the per-label hashes the hash file is keyed by. Under cquery a
+   * target's name is its configured identity (`label|checksum`, see
+   * [com.bazel_diff.bazel.CONFIGURED_RULE_INPUT_SEPARATOR]), and one label can be hashed in several
+   * configurations. A label hashed once keeps its digest as is, so hash files do not change where
+   * nothing was collapsed. A label with several instances hashes all of them, in name order, so a
+   * change reaching any instance changes the label, and its dependency edges are the union of its
+   * instances', as labels.
+   */
+  private fun aggregateByLabel(
+      digests: List<Triple<String, String, TargetDigest>>
+  ): Map<String, TargetHash> {
+    val result = HashMap<String, TargetHash>(digests.size * 4 / 3 + 1)
+    for ((label, instances) in digests.groupBy { decodeConfiguredRuleInputLabel(it.first) }) {
+      val sorted = if (instances.size == 1) instances else instances.sortedBy { it.first }
+      val (_, type, first) = sorted[0]
+      val overall: ByteArray
+      val direct: ByteArray
+      if (sorted.size == 1) {
+        overall = first.overallDigest
+        direct = first.directDigest
+      } else {
+        overall = sha256 { for ((_, _, digest) in sorted) safePutBytes(digest.overallDigest) }
+        direct = sha256 { for ((_, _, digest) in sorted) safePutBytes(digest.directDigest) }
+      }
+      val deps =
+          if (first.deps == null) null
+          else
+              sorted
+                  .flatMap { it.third.deps.orEmpty() }
+                  .map { decodeConfiguredRuleInputLabel(it) }
+                  .distinct()
+      result[label] = TargetHash(type, overall.toHexString(), direct.toHexString(), deps)
+    }
+    return result
+  }
+
+  /**
+   * Maps every target name to the rule that produces it: a rule to itself, a generated file to its
+   * generating rule. Under cquery a generated file names its generating rule in the file's own
+   * configuration; when that instance is not in the graph, the file resolves to another instance of
+   * the same label.
+   */
   private fun traverseGraph(
       allTargets: List<BazelTarget>,
       targetToRule: MutableMap<String, BazelRule>
   ) {
-    var targetsToAnalyse: Set<BazelTarget> = Sets.newHashSet(allTargets)
-    while (!targetsToAnalyse.isEmpty()) {
-      val initialSize = targetsToAnalyse.size
-      val nextTargets: MutableSet<BazelTarget> = Sets.newHashSet()
-      for (target in targetsToAnalyse) {
-        val targetName = target.name
-        when (target) {
-          is BazelTarget.GeneratedFile -> {
-            targetToRule[target.generatingRuleName]?.let { targetToRule[targetName] = it }
-                ?: nextTargets.add(target)
-          }
-          is BazelTarget.Rule -> targetToRule[targetName] = target.rule
-          is BazelTarget.SourceFile -> continue
-        }
-      }
-      val newSize = nextTargets.size
-      if (newSize >= initialSize) {
-        throw RuntimeException("Not possible to traverse the build graph")
-      }
-      targetsToAnalyse = nextTargets
+    for (target in allTargets) {
+      if (target is BazelTarget.Rule) targetToRule[target.name] = target.rule
+    }
+    var labelInstances: Map<String, List<String>>? = null
+    for (target in allTargets) {
+      if (target !is BazelTarget.GeneratedFile) continue
+      val rule =
+          targetToRule[target.generatingRuleName]
+              ?: run {
+                val instances =
+                    labelInstances
+                        ?: configuredLabelInstances(targetToRule.keys).also { labelInstances = it }
+                instances[decodeConfiguredRuleInputLabel(target.generatingRuleName)]
+                    ?.firstOrNull()
+                    ?.let { targetToRule[it] }
+              }
+              ?: throw RuntimeException("Not possible to traverse the build graph")
+      targetToRule[target.name] = rule
     }
   }
 

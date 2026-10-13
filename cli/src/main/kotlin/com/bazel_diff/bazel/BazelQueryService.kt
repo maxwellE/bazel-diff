@@ -122,22 +122,35 @@ class BazelQueryService(
     val targets =
         outputFile.inputStream().buffered().use { proto ->
           if (useCquery) {
-            if (canUseStreamedProtoWithCquery) {
-                  mutableListOf<AnalysisProtosV2.CqueryResult>()
-                      .apply {
-                        while (true) {
-                          val result =
-                              AnalysisProtosV2.CqueryResult.parseDelimitedFrom(proto) ?: break
-                          // EOF
-                          add(result)
-                        }
-                      }
-                      .flatMap { it.resultsList }
+            val results =
+                if (canUseStreamedProtoWithCquery) {
+                  mutableListOf<AnalysisProtosV2.CqueryResult>().apply {
+                    while (true) {
+                      val result = AnalysisProtosV2.CqueryResult.parseDelimitedFrom(proto) ?: break
+                      // EOF
+                      add(result)
+                    }
+                  }
                 } else {
-                  AnalysisProtosV2.CqueryResult.parseFrom(proto).resultsList
+                  listOf(AnalysisProtosV2.CqueryResult.parseFrom(proto))
                 }
-                .mapNotNull { toBazelTarget(it.target) }
-                .filter { it.name in compatibleTargetSet }
+            // Each result carries its configuration inline (the deprecated `configuration` field,
+            // which Bazel still populates) and by id into `configurations`. A streamed result's id
+            // table only arrives after the results that use it, so ids resolve once all are read.
+            val checksums =
+                results
+                    .flatMap { it.configurationsList }
+                    .filter { isConfigured(it.checksum) }
+                    .associate { it.id to it.checksum }
+            results
+                .flatMap { it.resultsList }
+                .mapNotNull { configured ->
+                  val checksum =
+                      configured.configuration.checksum.takeIf { isConfigured(it) }
+                          ?: checksums[configured.configurationId]
+                  toBazelTarget(configureTarget(configured.target, checksum))
+                }
+                .filter { decodeConfiguredRuleInputLabel(it.name) in compatibleTargetSet }
           } else {
             mutableListOf<Build.Target>()
                 .apply {
@@ -609,6 +622,38 @@ class BazelQueryService(
     } catch (e: Exception) {
       logger.w { "Failed to parse dump_repo_mapping output: ${e.message}" }
       emptyMap()
+    }
+  }
+
+  /** Bazel reports the null configuration (source files, package groups) with this checksum. */
+  private fun isConfigured(checksum: String): Boolean = checksum.isNotEmpty() && checksum != "null"
+
+  /**
+   * Names a rule or generated file by its configured identity, `label|checksum` (see
+   * [CONFIGURED_RULE_INPUT_SEPARATOR]). Source files are never configured, so their labels stay
+   * bare and keep matching the bare labels in `configuredRuleInput`. A generated file shares its
+   * generating rule's configuration, so that reference is named the same way.
+   */
+  private fun configureTarget(target: Build.Target, checksum: String?): Build.Target {
+    if (checksum == null) return target
+    return when (target.type) {
+      Build.Target.Discriminator.RULE ->
+          target
+              .toBuilder()
+              .setRule(
+                  target.rule.toBuilder().setName(configuredTargetName(target.rule.name, checksum)))
+              .build()
+      Build.Target.Discriminator.GENERATED_FILE ->
+          target
+              .toBuilder()
+              .setGeneratedFile(
+                  target.generatedFile
+                      .toBuilder()
+                      .setName(configuredTargetName(target.generatedFile.name, checksum))
+                      .setGeneratingRule(
+                          configuredTargetName(target.generatedFile.generatingRule, checksum)))
+              .build()
+      else -> target
     }
   }
 

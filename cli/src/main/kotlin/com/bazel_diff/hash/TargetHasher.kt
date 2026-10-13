@@ -23,31 +23,28 @@ class TargetHasher : KoinComponent {
   ): TargetDigest {
     return when (target) {
       is BazelTarget.GeneratedFile -> {
-        val generatingRuleDigest = ruleHashes[target.generatingRuleName]
-        var digest: TargetDigest
-        if (generatingRuleDigest != null) {
-          digest = generatingRuleDigest
-        } else {
-          val generatingRule =
-              allRulesMap[target.generatingRuleName]
-                  ?: throw RuntimeException(
-                      "Unexpected generating rule ${target.generatingRuleName}")
-          digest =
-              ruleHasher.digest(
-                  generatingRule,
-                  allRulesMap,
-                  ruleHashes,
-                  sourceDigests,
-                  seedHash,
-                  packageBzlSeeds,
-                  depPath = null,
-                  ignoredAttrs,
-                  modifiedFilepaths,
-                  hashInvocationContext)
-        }
+        // The file's own entry in allRulesMap is its generating rule as BuildGraphHasher resolved
+        // it, which under cquery may be another configured instance of the rule the file names.
+        val generatingRule =
+            allRulesMap[target.generatingRuleName]
+                ?: allRulesMap[target.name]
+                ?: throw RuntimeException("Unexpected generating rule ${target.generatingRuleName}")
+        var digest =
+            ruleHashes[generatingRule.name]
+                ?: ruleHasher.digest(
+                    generatingRule,
+                    allRulesMap,
+                    ruleHashes,
+                    sourceDigests,
+                    seedHash,
+                    packageBzlSeeds,
+                    depPath = null,
+                    ignoredAttrs,
+                    modifiedFilepaths,
+                    hashInvocationContext)
 
         // Add the generating rule name as a dep of the generated file.
-        digest = digest.clone(newDeps = listOf(target.generatingRuleName))
+        digest = digest.clone(newDeps = listOf(generatingRule.name))
         digest
       }
       is BazelTarget.Rule -> {

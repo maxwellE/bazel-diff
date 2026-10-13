@@ -3192,6 +3192,74 @@ class E2ETest {
    * (`{target: hash}`) emitted for non-bzlmod workspaces.
    */
   @Suppress("UNCHECKED_CAST")
+  // Regression test for https://github.com/Tinder/bazel-diff/issues/512: `deps(//:app)` under
+  // cquery contains `//:app` twice, in the default configuration where it depends on `//:helper`
+  // and in the bootstrap configuration `//:helper` transitions it into, where it has no deps.
+  // Keyed by label, one instance was dropped: either `//:helper`'s edge closed a false cycle and
+  // generate-hashes failed, or `//:app` lost its edge to `//:helper` and a change to `input.txt`
+  // never reached it.
+  @Test
+  fun testCqueryKeepsDependenciesOfEveryConfiguredInstance() {
+    val before = copyTestWorkspace("cquery_transition_dedup")
+    val after = copyTestWorkspace("cquery_transition_dedup")
+    File(after, "input.txt").writeText("after\n")
+    val outputDir = temp.newFolder()
+    val from = File(outputDir, "from.json")
+    val to = File(outputDir, "to.json")
+    val edges = File(outputDir, "edges.json")
+    val impacted = File(outputDir, "impacted.txt")
+    val cli = CommandLine(BazelDiff())
+
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w",
+                before.absolutePath,
+                "-b",
+                "bazel",
+                "--useCquery",
+                "--cqueryExpression",
+                "deps(//:app)",
+                "-d",
+                edges.absolutePath,
+                from.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "generate-hashes",
+                "-w",
+                after.absolutePath,
+                "-b",
+                "bazel",
+                "--useCquery",
+                "--cqueryExpression",
+                "deps(//:app)",
+                to.absolutePath))
+        .isEqualTo(0)
+    assertThat(
+            cli.execute(
+                "get-impacted-targets",
+                "-w",
+                after.absolutePath,
+                "-b",
+                "bazel",
+                "-sh",
+                from.absolutePath,
+                "-fh",
+                to.absolutePath,
+                "-o",
+                impacted.absolutePath))
+        .isEqualTo(0)
+
+    val depEdges: Map<String, List<String>> =
+        Gson().fromJson(edges.readText(), object : TypeToken<Map<String, List<String>>>() {}.type)
+    val appEdges = depEdges.entries.first { it.key.endsWith("//:app") }.value
+    assertThat(appEdges.any { it.endsWith("//:helper") }).isEqualTo(true)
+    val impactedTargets = impacted.readLines().filter { it.isNotBlank() }
+    assertThat(impactedTargets.any { it.endsWith("//:helper") }).isEqualTo(true)
+    assertThat(impactedTargets.any { it.endsWith("//:app") }).isEqualTo(true)
+  }
+
   private fun readTargetHashes(file: File): Map<String, Any> {
     val root: Map<String, Any> =
         Gson().fromJson(file.readText(), object : TypeToken<Map<String, Any>>() {}.type)
