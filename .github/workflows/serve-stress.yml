@@ -45,20 +45,20 @@ jobs:
         run: >
           python3 tools/serve_stress.py
           --bazel "$HOME/go/bin/bazelisk"
-          --metrics-out serve-stress-metrics.json
-          --summary-out serve-stress-summary.md
+          --metrics-out "serve-stress-metrics.json"
+          --summary-out "serve-stress-summary.md"
           ${{ inputs.quick && '--quick' || '' }}
       - name: Publish step summary
         if: always()
         run: |
-          if [ -f serve-stress-summary.md ]; then
-            cat serve-stress-summary.md >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "serve-stress-summary.md" ]; then
+            cat "serve-stress-summary.md" >> "$GITHUB_STEP_SUMMARY"
           fi
       - name: Upload metrics artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: serve-stress-metrics-${{ github.run_id }}
+          name: serve-stress-${{ github.run_id }}
           path: |
             serve-stress-metrics.json
             serve-stress-summary.md

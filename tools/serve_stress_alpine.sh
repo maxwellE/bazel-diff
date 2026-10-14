@@ -4,15 +4,16 @@
 #   .github/workflows/serve-stress-alpine-real.yml  (real repos via REAL_* env)
 #
 # Runs tools/serve_stress.py inside an x86_64 Alpine (musl) container hard-capped at 8 GiB /
-# few vCPUs, to surface performance choke points on a low-resource node: JVM startup + heap
-# pressure for serve, `bazel query` server cost, git checkout latency, and OOM behavior that a
+# few vCPUs, to surface performance choke points on a low-resource node: serve's own memory
+# footprint, `bazel query` server cost, git checkout latency, and OOM behavior that a
 # 4-core/16 GiB glibc runner never shows. Hermetic and real-repo modes share this entry so the
 # musl / cgroup footprint path is identical; only the harness args differ.
 #
 # The host workflow stages everything this script needs into one directory (mounted here,
 # path-independent -- the script locates it from $0):
 #
-#   <stage>/bazel-diff.jar            the //cli:bazel-diff_deploy.jar built on the glibc host
+#   <stage>/bazel-diff                the statically linked musl binary (//release:bazel-diff-rust
+#                                     --config=release-linux) built on the glibc host
 #   <stage>/bazel-glibc               the official bazel release binary (see version note below)
 #   <stage>/.bazelversion             copied into fabricated workspaces (harness expects it)
 #   <stage>/tools/serve_stress.py     the harness + its shared plumbing + this script
@@ -24,11 +25,11 @@
 # newer Bazel to parse its BUILD files; floating/missing pins still fall back to bazel-diff's
 # pin. Either way this script just probes and runs whatever binary was staged.
 #
-# Building bazel-diff *inside* Alpine would require a full glibc Bazel toolchain to work under
-# musl -- the most fragile possible path -- so the jar is built on the host and only *run* here,
-# on Alpine's own musl OpenJDK. The one genuinely glibc-bound piece is the `bazel` binary that
-# serve shells out to for `bazel query`: official releases are glibc-linked and there is no
-# official musl build. Two flavors are attempted, best first, each proven with a real probe
+# Building bazel-diff *inside* Alpine would require a full Bazel toolchain to work under musl --
+# the most fragile possible path -- so the binary is cross-built on the host (it is the same
+# static musl asset the release publishes) and only *run* here. The one genuinely glibc-bound
+# piece is the `bazel` binary that serve shells out to for `bazel query`: official releases are
+# glibc-linked and there is no official musl build. Two flavors are attempted, best first, each proven with a real probe
 # query before the 30+ minute harness commits to it:
 #
 #   1. the official release binary under gcompat (glibc shim), with the server JVM redirected to
@@ -58,8 +59,8 @@ cat /etc/alpine-release
 
 # ------------------------------------------------------------------------------------------
 # Packages: harness deps (python3, git + git daemon), ca-certificates for HTTPS real-repo
-# clones, the musl JDK that runs both the serve jar and (redirected) bazel server, and the
-# glibc shim for the official bazel client.
+# clones, the musl JDK that runs the (redirected) bazel server, and the glibc shim for the
+# official bazel client. bazel-diff itself is static and needs nothing.
 # ------------------------------------------------------------------------------------------
 apk add --no-cache python3 git git-daemon ca-certificates openjdk21-jdk gcompat libstdc++ libgcc
 
@@ -74,17 +75,14 @@ export PATH="$JAVA_HOME/bin:$PATH"
 java -version 2>&1 | head -2
 
 # ------------------------------------------------------------------------------------------
-# The launcher the harness invokes (base.LAUNCHER = <stage>/bazel-bin/cli/bazel-diff, since
-# REPO_ROOT is derived from serve_stress.py's location). A bazel-built java_binary launcher
-# does not survive the host->container move (runfiles + embedded JDK paths), so a plain
-# wrapper over the staged deploy jar stands in for it; --skip-build makes the harness use it.
+# The launcher the harness invokes (base.LAUNCHER = <stage>/bazel-bin/src/bazel-diff, since
+# REPO_ROOT is derived from serve_stress.py's location). The staged binary is static, so it
+# is placed there as-is; --skip-build makes the harness use it.
 # ------------------------------------------------------------------------------------------
-mkdir -p "$STAGE/bazel-bin/cli"
-cat > "$STAGE/bazel-bin/cli/bazel-diff" <<'EOF'
-#!/bin/sh
-exec java -jar "$(dirname "$0")/../../bazel-diff.jar" "$@"
-EOF
-chmod +x "$STAGE/bazel-bin/cli/bazel-diff"
+mkdir -p "$STAGE/bazel-bin/src"
+cp "$STAGE/bazel-diff" "$STAGE/bazel-bin/src/bazel-diff"
+chmod +x "$STAGE/bazel-bin/src/bazel-diff"
+"$STAGE/bazel-bin/src/bazel-diff" --version
 
 # ------------------------------------------------------------------------------------------
 # Pick a bazel that actually works on this musl userland (see flavor list in the header).
@@ -94,17 +92,33 @@ chmod +x "$STAGE/bazel-bin/cli/bazel-diff"
 # up -- the two distinct ways a glibc bazel can die on musl. Also proves the loading phase
 # (package parsing) works, which is all `serve` asks of bazel. The server is shut down after
 # so probe servers never linger into the measured phases.
+#
+# The probe query pulls Bazel's implicit module deps (rules_java etc.) from GitHub Releases, so
+# a 5xx/timeout there is a network flake, not a musl incompatibility. Those failures are retried
+# a few times before the flavor is declared broken; any other failure gives up immediately so a
+# genuinely non-working binary still falls through to the next flavor quickly.
 probe_bazel() {
     pd=/tmp/bazel-probe/ws
-    rm -rf /tmp/bazel-probe
-    mkdir -p "$pd"
-    printf 'module(name = "probe", version = "0.0.0")\n' > "$pd/MODULE.bazel"
-    printf 'filegroup(name = "x")\n' > "$pd/BUILD.bazel"
-    if (cd "$pd" && timeout 600 "$1" --output_user_root=/tmp/bazel-probe/root query //:x); then
-        (cd "$pd" && timeout 60 "$1" --output_user_root=/tmp/bazel-probe/root shutdown) || true
-        return 0
-    fi
-    return 1
+    plog=/tmp/bazel-probe.log
+    attempt=1
+    while :; do
+        rm -rf /tmp/bazel-probe
+        mkdir -p "$pd"
+        printf 'module(name = "probe", version = "0.0.0")\n' > "$pd/MODULE.bazel"
+        printf 'filegroup(name = "x")\n' > "$pd/BUILD.bazel"
+        if (cd "$pd" && timeout 600 "$1" --output_user_root=/tmp/bazel-probe/root query //:x) > "$plog" 2>&1; then
+            cat "$plog"
+            (cd "$pd" && timeout 60 "$1" --output_user_root=/tmp/bazel-probe/root shutdown) || true
+            return 0
+        fi
+        cat "$plog"
+        if [ "$attempt" -ge 4 ] || ! grep -Eq 'Error downloading|GET returned 5[0-9][0-9]|Gateway Time-out|Connection reset|timed out|Unknown host' "$plog"; then
+            return 1
+        fi
+        echo "WARN: bazel probe hit a transient download error (attempt $attempt/4); retrying in $((attempt * 15))s" >&2
+        sleep $((attempt * 15))
+        attempt=$((attempt + 1))
+    done
 }
 
 BAZEL=""

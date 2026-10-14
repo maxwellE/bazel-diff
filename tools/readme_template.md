@@ -7,7 +7,7 @@
 
 `bazel-diff` offers several key advantages over rolling your own target diffing solution
 
-1. `bazel-diff` is designed for very large Bazel projects. We use Java Protobuf's `parseDelimitedFrom` method alongside Bazel Query's `streamed_proto` output option. These two together allow you to parse Gigabyte or larger protobuf messages. We have tested it with projects containing tens of thousands of targets.
+1. `bazel-diff` is designed for very large Bazel projects. We stream Bazel Query's `streamed_proto` output message by message instead of loading it whole, which allows you to parse Gigabyte or larger protobuf outputs. We have tested it with projects containing hundreds of thousands of targets.
 2. We avoid usage of large command line query lists when interacting with Bazel, [issue here](https://github.com/bazelbuild/bazel/issues/8609). When you interact with Bazel with thousands of query parameters you can reach an upper maximum limit, seeing this error `bash: /usr/local/bin/bazel: Argument list too long`. `bazel-diff` is smart enough to avoid these errors.
 3. `bazel-diff` has been tested with file renames, deletions, and modifications. Works on `bzl` files, `WORKSPACE` files, `BUILD` files and regular files
 
@@ -25,8 +25,9 @@ This approach was inspired by the [following BazelConf talk](https://www.youtube
 ## Prerequisites
 
 * Git
-* Bazel 3.3.0 or higher
-* Java 8 JDK or higher (Bazel requires this)
+* Bazel 8 or higher (use the latest release for your major version)
+
+Bazel needs a JDK; the `bazel-diff` binary does not.
 
 ## Getting Started
 
@@ -107,7 +108,94 @@ This will produce an impacted targets json list with target label, target distan
 ]
 ```
 
-## Query Service (experimental)
+## Explaining Why a Target Was Impacted
+
+`get-impacted-targets` tells you *that* `//service/a:app` needs rebuilding. It does not tell you
+*why* — and a service can be impacted for several reasons at once: it changed itself, a shared
+module it depends on changed, or both. `explain` answers that question by attributing the target's
+hash change to the upstream target(s) actually responsible, and by showing the dependency path the
+change travelled along. See [issue #479](https://github.com/Tinder/bazel-diff/issues/479).
+
+It reads the same three files `get-impacted-targets` consumes — it runs no `bazel query` and needs
+no workspace — so it is cheap to run after the fact on a CI machine that only kept the artifacts:
+
+```bash
+bazel-diff generate-hashes -w /path/to/workspace -b bazel --depEdgesFile deps.json final_hashes.json
+
+bazel-diff explain \
+  -sh starting_hashes.json \
+  -fh final_hashes.json \
+  -d deps.json \
+  --target //service/a:app
+```
+
+```text
+//service/a:app  [Rule]
+IMPACTED (directly -- this target changed on its own)
+
+Root causes: 3
+
+  1. //service/a:app  [Rule]
+     the rule's own definition or attributes changed
+     0 hops -- this is the queried target itself
+     //service/a:app
+
+  2. //service/a:main.py  [SourceFile]
+     source file content changed
+     1 hop (0 package boundaries crossed)
+     //service/a:main.py -> //service/a:app
+
+  3. //common/data:util.py  [SourceFile]
+     source file content changed
+     3 hops (2 package boundaries crossed)
+     //common/data:util.py -> //common:gen_srcs -> //common:lib -> //service/a:app
+```
+
+A **root cause** is a target whose *own* hash changed — its `directHash` moved, or it is new in the
+final revision. Everything between a root cause and the queried target merely carried the change
+downstream. This is the same DIRECT/INDIRECT classification that backs the distance metrics above,
+so `explain` and `--depEdgesFile` always agree on which targets are roots.
+
+`--depEdgesFile` is required: attribution is a walk over those edges. Generate it with
+`generate-hashes --depEdgesFile` (or, on the query service, fetch it from `GET /dependency_edges`).
+
+### Visualizing the blame graph
+
+`--format dot` and `--format mermaid` emit the blame subgraph — the queried target, the root causes,
+and the targets that carried the change between them. Only that subgraph is rendered, never the
+whole impacted set, which is what keeps the output readable on a monorepo.
+
+```bash
+bazel-diff explain -sh starting_hashes.json -fh final_hashes.json -d deps.json \
+  --target //service/a:app --format dot -o why.dot
+dot -Tsvg why.dot -o why.svg
+```
+
+Edges point in **impact-propagation** direction — root cause at the top, queried target at the
+bottom — so reading downward follows the change as it flows in. (This is the reverse of the
+`--depEdgesFile` orientation, which maps a label to the deps it consumes.)
+
+`--format mermaid` emits a `flowchart TD` that renders inline in a GitHub comment or PR description,
+which is handy for posting "here is why your PR rebuilt these targets" from CI. Each role has its
+own border color *and* node shape *and* an explicit role label, so the graph stays readable in
+monochrome and for viewers who cannot separate the two hues.
+
+`--format json` gives the same data structurally (root causes, paths, nodes, edges) for feeding
+another tool.
+
+### Bounding the output
+
+A target deep in a monorepo can have a great many root causes. Two knobs bound the work, and
+neither ever truncates silently — the full count is always reported:
+
+* `--maxRootCauses` (default `25`) reports only the nearest N root causes. `0` means all of them.
+* `--maxDepth` (default `-1`, unbounded) stops the search N dependency hops above the queried
+  target. When a bound cuts the search short, a warning says so.
+
+## Query Service
+
+`bazel-diff serve` is production ready — it has been validated internally in production CI and is
+supported for production use.
 
 Instead of running `generate-hashes` from scratch on every CI invocation, you can run `bazel-diff` as
 a long-running HTTP service that answers affectedness queries between two git revisions and caches
@@ -158,8 +246,8 @@ curl 'http://localhost:8080/impacted_targets?from=main&to=my-feature-branch'
   as unchanged, turning an O(all source files) content read into O(changed files) — the same
   optimization as `generate-hashes --modified-filepaths`. The list must be a **superset** of what
   actually changed: a truly-changed file left off it is content-skipped on both sides and its
-  impacted targets are missed (hence experimental). Omit it (or send `[]`) for the full-content hash,
-  identical to the GET form. `POST /impacted_targets_with_distances` accepts the same body.
+  impacted targets are missed, so treat the list as a correctness contract. Omit it (or send `[]`)
+  for the full-content hash, identical to the GET form. `POST /impacted_targets_with_distances` accepts the same body.
 
 ```bash
 curl -X POST http://localhost:8080/impacted_targets \
@@ -259,7 +347,48 @@ revision are also harmless — entries are deterministic per key, so last-write-
 content. The `--cacheMax*` pruning flags bound the *local* tier only; bound the bucket with an S3
 lifecycle policy instead.
 
-Notes and current limitations:
+### Shared Sonatype Nexus cache
+
+If your organization already runs [Sonatype Nexus Repository](https://www.sonatype.com/products/sonatype-nexus-repository),
+a *raw (hosted)* repository can serve as the shared tier instead of S3. It behaves exactly like
+the S3 tier above — local disk first, Nexus on a local miss (backfilling disk on a hit), every
+generated entry published to both, and every Nexus failure degraded to a miss or a local-only
+write — and the two are mutually exclusive.
+
+```bash
+export BAZEL_DIFF_NEXUS_PASSWORD=...   # password, or a Nexus user token's pass code
+bazel-diff serve \
+  --workspacePath /path/to/workspace-clone \
+  --cacheDir /var/cache/bazel-diff \
+  --nexusUrl https://nexus.example.com \
+  --nexusRepository bazel-diff-cache \
+  --nexusPrefix my-repo \
+  --nexusUsername bazel-diff-svc
+```
+
+Entries live at `<nexusUrl>/repository/<nexusRepository>/<nexusPrefix>/<key>.json` and are read
+and written with plain `GET`/`PUT` against Nexus's raw content API. Include any context path Nexus
+is served under in `--nexusUrl` (e.g. `https://example.com/nexus`).
+
+* **Repository setup.** Create a *raw (hosted)* repository and set its *Deployment policy* to
+  **Allow redeploy**: replicas that race on the same revision each publish (identical) content,
+  and Nexus answers a redeploy under "Disable redeploy" with `400`, which is logged as a failed
+  write. A raw *group* or *proxy* repository cannot accept writes.
+* **Credentials.** `--nexusUsername` (or `BAZEL_DIFF_NEXUS_USERNAME`) and the
+  `BAZEL_DIFF_NEXUS_PASSWORD` environment variable are sent as HTTP basic auth; set both, or
+  neither for a repository that allows anonymous access. The password is deliberately
+  environment-only so it never appears in a process listing, and credentials embedded in
+  `--nexusUrl` are rejected. A Nexus [user token](https://help.sonatype.com/en/user-tokens.html)
+  works too: pass its name code as the username and pass code as the password. The account needs
+  `nx-repository-view-raw-<repository>-read`, `-add` and `-edit` privileges.
+* **TLS.** Public CAs are trusted out of the box. For a Nexus behind an internal CA, point
+  `--nexusCaCert` at a PEM bundle of the extra roots to trust.
+* **Redirects are not followed**, so basic-auth credentials are never replayed to another host;
+  point `--nexusUrl` at the final `https://` address rather than one that redirects to it.
+* **Retention.** As with S3, `--cacheMax*` bounds the local tier only. Bound the repository with a
+  Nexus *cleanup policy* (e.g. by component age or last-downloaded date) attached to it.
+
+Notes and operational guidance:
 
 * Distance metrics (`/impacted_targets_with_distances`) and the generate-hashes graph
   (`/dependency_edges`) require the dependency-edge graph, which is
@@ -267,6 +396,17 @@ Notes and current limitations:
   entry, so it is opt-in. The flag is folded into the cache key, so enabling or disabling it never
   reuses a previously cached entry of the other kind. This mirrors the `generate-hashes --depEdgesFile`
   / `get-impacted-targets --depEdgesFile` flow used by the CLI.
+
+* Dependency fingerprinting (`--dependencyFingerprint`) is opt-in. When enabled, every generated
+  cache entry records a fingerprint of the workspace's external-dependency state (the bzlmod module
+  graph and the resolved repository definitions, via `bazel mod`), and a cached entry -- local or
+  shared tier -- is only served when that fingerprint still matches the checked-out revision; entries
+  without a fingerprint, or with a stale one, are regenerated. This catches hashes that went stale
+  because an external repository changed underneath an unchanged commit, at the cost of a checkout
+  and a `bazel mod` round trip on every cache lookup. It is off by default, in which case a cache
+  entry is trusted on its key alone and the fingerprint is neither computed nor stored. The flag is
+  not part of the cache key: a guarded server rewrites unguarded entries with a fingerprint as it
+  regenerates them, and an unguarded server serves guarded entries as-is.
 
 * The service checks out revisions inside `--workspacePath`, so point it at a dedicated clone, not a
   working tree you edit. All workspace-mutating work (git checkout + `bazel query`) is serialized,
@@ -284,7 +424,8 @@ Notes and current limitations:
   evicting least-recently-used entries first — a cache hit refreshes an entry's recency, so revisions
   under active query are not expired out from under live traffic. With no `--cacheMax*` flag set the
   cache is never pruned (the previous behavior). The `--cacheMax*` flags always bound the local-disk
-  tier only; the shared S3 tier (see above) manages its own retention via a bucket lifecycle policy.
+  tier only; the shared S3 or Nexus tier (see above) manages its own retention via a bucket
+  lifecycle policy or a Nexus cleanup policy.
 * Query-affecting flags (`--useCquery`, `--fineGrainedHashExternalRepos`, etc.) mirror
   `generate-hashes`, and are folded into the cache key so a server started with different flags never
   serves another configuration's cached hashes.
@@ -296,7 +437,7 @@ Notes and current limitations:
   such hash is cheaper because it skips reading unchanged files. The extra entries are bounded by the
   same LRU `--cacheMax*` pruning as everything else.
 * Containerization and multi-instance deployment manifests are not yet included; the shared S3
-  cache tier above is the building block for running replicas behind a load balancer.
+  or Nexus cache tier above is the building block for running replicas behind a load balancer.
 
 <!-- BEGIN_SECTION: cli-help -->
 <!-- END_SECTION: cli-help -->
@@ -311,124 +452,90 @@ content of the file are converted into a SHA256 value.
 
 ## Installing
 
-### Integrate into your project (recommended)
+### Prebuilt binaries (recommended)
 
-First, add the following snippet to your project:
+Every [release](https://github.com/Tinder/bazel-diff/releases) includes platform binaries.
+Linux binaries are statically linked with musl:
 
-#### Bzlmod snippet
+```terminal
+# Linux amd64
+curl -Lo bazel-diff https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-linux-amd64
+chmod +x bazel-diff
+
+# Linux arm64
+curl -Lo bazel-diff https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-linux-arm64
+chmod +x bazel-diff
+
+# macOS arm64
+curl -Lo bazel-diff https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-macos-arm64
+chmod +x bazel-diff
+```
+
+Windows amd64: download `bazel-diff-rust-windows-amd64.exe` from the
+[latest release](https://github.com/Tinder/bazel-diff/releases/latest).
+
+### Integrate into your project
+
+With Bazel 8 or higher, add the following to your `MODULE.bazel`:
 
 ```bazel
 bazel_dep(name = "bazel-diff", version = "{{BAZEL_DIFF_VERSION}}")
 ```
 
+Until `rules_rs` fixes `all_crate_deps(package_name = "")`, copy
+[`rules_rs_package_name.patch`](patches/rules_rs_package_name.patch) into your
+workspace root and add this override to the same `MODULE.bazel`:
+
+```bazel
+single_version_override(
+    module_name = "rules_rs",
+    version = "0.0.112",
+    patch_strip = 1,
+    patches = ["//:rules_rs_package_name.patch"],
+)
+```
+
+Bazel only applies overrides from the root module.
+
 You can now run the tool with:
 
 ```terminal
-bazel run @bazel-diff//cli:bazel-diff
+bazel run @bazel-diff//:bazel-diff -- --help
 ```
 
-#### WORKSPACE snippet
+On Windows, add `--host_platform=@bazel-diff//platforms:windows_msvc` and
+`--legacy_external_runfiles` before `--`. Windows builds need Visual Studio with the
+C++ build tools installed.
+Bazel does not read a dependency's `.bazelrc`.
 
-```bazel
-http_jar = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_jar")
-http_jar(
-    name = "bazel-diff",
-    urls = [
-        "https://github.com/Tinder/bazel-diff/releases/download/7.0.0/bazel-diff_deploy.jar"
-    ],
-    sha256 = "0b9e32f9c20e570846b083743fe967ae54d13e2a1f7364983e0a7792979442be",
-)
-```
-
-Second, add in your root `BUILD.bazel` file:
-
-```bazel
-load("@rules_java//java:defs.bzl", "java_binary")
-
-java_binary(
-    name = "bazel-diff",
-    main_class = "com.bazel_diff.Main",
-    runtime_deps = ["@bazel-diff//jar"],
-)
-```
-
-That's it! You can now run the tool with:
-
-```terminal
-bazel run //:bazel-diff
-```
-
-> Note, in releases prior to 2.0.0 the value for the `main_class` attribute is just `BazelDiff`
-
-### Run Via JAR Release
-
-```terminal
-curl -Lo bazel-diff.jar https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff_deploy.jar
-java -jar bazel-diff.jar -h
-```
+Bzlmod is required; `@bazel-diff//:bazel-diff-rust` is an alias for the same binary.
 
 ### Build from Source
 
-After cloning down the repo, you are good to go, Bazel will handle the rest
-
-To run the project
+Use Bazel 8 or higher. Bazel downloads the Rust and C/C++ toolchains:
 
 ```terminal
-bazel run :bazel-diff -- bazel-diff -h
+bazel run :bazel-diff -- --help
 ```
+
+Release binaries are written to `bazel-bin/release/bazel-diff-rust-<os>-<arch>[.exe]`:
+
+```terminal
+make release_rust_binary              # bazel build //release:bazel-diff-rust --config=release
+make release_rust_binary_linux        # ... --config=release-linux
+make release_rust_binary_linux_arm64  # ... --config=release-linux-arm64
+```
+
+`--config=release-linux` and `--config=release-linux-arm64` build static musl
+binaries for amd64 and arm64, respectively. Both support cross-compilation from
+Linux and Apple Silicon macOS.
 
 #### Debugging (when running from source)
 
 To run `bazel-diff` with debug logging, run your commands with the `verbose` config like so:
 
 ```terminal
-bazel run :bazel-diff --config=verbose -- bazel-diff -h
-```
-
-### Build your own deployable JAR
-
-```terminal
-bazel build //cli:bazel-diff_deploy.jar
-java -jar bazel-bin/cli/bazel-diff_deploy.jar # This JAR can be run anywhere
-```
-
-### Build from source in your Bazel Project
-
-Add the following to your `WORKSPACE` file to add the external repositories, replacing the `RELEASE_ARCHIVE_URL` with the archive url of the bazel-diff release you wish to depend on:
-
-```bazel
-load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
-
-http_archive(
-  name = "bazel-diff",
-  urls = [
-        "RELEASE_ARCHIVE_URL",
-    ],
-    sha256 = "UPDATE_ME",
-    strip_prefix = "UPDATE_ME"
-)
-
-load("@bazel-diff//:repositories.bzl", "bazel_diff_dependencies")
-
-bazel_diff_dependencies()
-
-load("@rules_jvm_external//:defs.bzl", "maven_install")
-load("@bazel-diff//:artifacts.bzl", "BAZEL_DIFF_MAVEN_ARTIFACTS")
-
-maven_install(
-    name = "bazel_diff_maven",
-    artifacts = BAZEL_DIFF_MAVEN_ARTIFACTS,
-    repositories = [
-        "http://uk.maven.org/maven2",
-        "https://jcenter.bintray.com/",
-    ],
-)
-```
-
-Now you can simply run `bazel-diff` from your project:
-
-```terminal
-bazel run @bazel-diff//cli:bazel-diff -- bazel-diff -h
+bazel run :bazel-diff --config=verbose -- --help
 ```
 
 ## Contributors
@@ -457,93 +564,34 @@ Precision CI at Scale: Target-Aware Workflows with Bazel Diff - Maxwell Elliott 
 
 ## Running the tests
 
-To run the tests simply run
+The unit tests, lint gates and tooling tests:
 
 ```terminal
-bazel test //...
+bazel test //:rust_tests //:rust_clippy_check //:rust_format_check //tools/...
 ```
 
-## Experimental Rust candidate
-
-This branch includes a proposed Rust implementation at `//:bazel-diff-rust`. The existing Kotlin
-implementation remains the default `//:bazel-diff` target and the released JAR.
+The end-to-end suite drives the real binary against fixture workspaces with a nested Bazel,
+one target per case (see [`tools/e2e/README.md`](tools/e2e/README.md)):
 
 ```terminal
-bazel run //:bazel-diff-rust -- --help
+bazel test //tests:e2e_test
 ```
-
-GitHub Releases also ship prebuilt binaries:
-
-```terminal
-# Linux amd64 (statically linked against musl -- no glibc requirement, so it
-# runs on any distribution, including Alpine and images older than the runner)
-curl -Lo bazel-diff-rust https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-linux-amd64
-chmod +x bazel-diff-rust
-
-# Linux arm64 (same musl static linking)
-curl -Lo bazel-diff-rust https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-linux-arm64
-chmod +x bazel-diff-rust
-
-# macOS arm64
-curl -Lo bazel-diff-rust https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-macos-arm64
-chmod +x bazel-diff-rust
-```
-
-Windows amd64: download
-`bazel-diff-rust-windows-amd64.exe` from the
-[latest release](https://github.com/Tinder/bazel-diff/releases/latest).
-
-Those assets are produced by Bazel alone -- CI runs nothing but the commands below and uploads
-whatever lands in `bazel-bin/release/`, so `//release:bazel-diff-rust` names the binary for the
-platform it was built for (`bazel-diff-rust-<os>-<arch>`, plus `.exe` on Windows):
-
-```terminal
-make release_rust_binary              # bazel build //release:bazel-diff-rust --config=release
-make release_rust_binary_linux        # ... --config=release-musl
-make release_rust_binary_linux_arm64  # ... --config=release-musl-arm64
-```
-
-`--config=release-musl` and `--config=release-musl-arm64` target
-`//platforms:linux_x86_64_musl` and `//platforms:linux_aarch64_musl`, which select a musl Rust
-std and a musl C toolchain, so the Linux assets are statically linked instead of inheriting the
-build runner's glibc as a version floor. They are cross-compiles: the same commands produce
-`bazel-diff-rust-linux-amd64` and `bazel-diff-rust-linux-arm64` on a glibc Linux host and on an
-Apple Silicon Mac.
-
-### Performance gate
-
-The Rust candidate is expected to be faster than Kotlin, and CI enforces it. `make perf-gate`
-runs both binaries over generated workloads -- a synthetic `streamed_proto` graph plus hash-file
-pairs, with no real workspace, Bazel server or Hyperfine involved -- and exits non-zero unless
-Rust wins on median wall time, on start-up-adjusted wall time, and in every paired round.
-
-```terminal
-make perf-gate
-make perf-gate SCALE=4 ROUNDS=9 JSON=/tmp/perf-gate.json
-```
-
-Outputs are compared before timings are reported, so a "speedup" can never come from the two
-implementations doing different work. See
-[`docs/kotlin-rust-perf-gate.md`](docs/kotlin-rust-perf-gate.md) for the protocol, the workload
-list and what to do when the gate fails. For measuring the two implementations against a real
-repository instead, see [`docs/kotlin-vs-rust-benchmark.md`](docs/kotlin-vs-rust-benchmark.md).
 
 ## Code coverage
 
-CI enforces a minimum **90% line coverage** on production sources. Kotlin
-(`cli/src/main/...`), Go (`tools/go/...`), and the experimental Rust
-implementation (`src/...`) are gated **independently** at 90% each, so thin
-coverage in one language can't hide behind well-covered code in another. To
-run the same checks locally:
+CI enforces a minimum **90% line coverage** on production sources. Rust
+(`src/...`, `tools/coverage/src/...`) and Go (`tools/go/...`) are gated
+**independently** at 90% each, so thin coverage in one language can't hide
+behind well-covered code in another. To run the same checks locally:
 
 ```terminal
 make coverage
 ```
 
 This invokes
-`bazel coverage --combined_report=lcov //cli/... //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/...`
+`bazel coverage --combined_report=lcov //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/...`
 and then runs `//tools:coverage-check` twice against the resulting LCOV report — once for
-the Kotlin main sources and once scoped to `tools/go/` (`--include tools/go/`). The check is
+the Rust sources and once scoped to `tools/go/` (`--include tools/go/`). The check is
 a Python `py_binary` ([`tools/coverage_check.py`](tools/coverage_check.py)) that prints a
 per-file table sorted by coverage (worst first), the overall percentage, and exits
 non-zero if the scoped coverage is below the threshold.
@@ -576,14 +624,11 @@ coverage_enforced_test(
 ```
 
 The default minimum is 90%. Go (`//tools/go/sample:sample_test`), the Rust
-LCOV merger (`//tools/coverage:lcov_merger_test`), the experimental Rust
-implementation (`//src:cli_tests` and `//src:rust_tests`), and the
-primary-owner Kotlin/JVM tests under `//cli` all carry minimums. When a
+LCOV merger (`//tools/coverage:lcov_merger_test`) and the CLI itself
+(`//src:cli_tests` and `//src:rust_tests`) all carry minimums. When a
 target's merged report falls below its minimum, the coverage run fails that
 target and the test log contains a per-file breakdown. See
 [`tools/coverage/README.md`](tools/coverage/README.md) for details.
-The Kotlin-to-Rust applicability and parity decisions are tracked in
-[`docs/kotlin-rust-test-parity.md`](docs/kotlin-rust-test-parity.md).
 
 For an interactive HTML report (annotated source with covered/uncovered lines
 highlighted), use `make coverage-html`. This requires the `lcov` package

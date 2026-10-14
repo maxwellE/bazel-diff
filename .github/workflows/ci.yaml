@@ -6,12 +6,11 @@ on:
   pull_request:
     branches: [ master ]
 
+# Preserve the Rust candidate, MSRV, E2E, and release-artifacts job names:
+# master branch protection requires these checks.
 jobs:
-  # Every Rust check here runs through Bazel, with no cargo and no host Rust
-  # toolchain: rules_rust downloads the compiler pinned in MODULE.bazel, so CI
-  # and a local `bazel test` agree on the exact rustc. //:rust_clippy_check and
-  # //:rust_format_check below stand in for `cargo clippy -- -D warnings` and
-  # `cargo fmt --all -- --check`.
+  # rules_rs pins rustc in MODULE.bazel. Bazel runs the tests, Clippy,
+  # rustfmt, and Python/Go tooling.
   rust-candidate:
     name: Rust candidate (Bazel ${{ matrix.bazel }})
     runs-on: ubuntu-latest
@@ -25,18 +24,24 @@ jobs:
         with:
           go-version: ^1.17
       - name: Setup Bazelisk
-        run: go install github.com/bazelbuild/bazelisk@latest
+        # Retries guard against transient proxy.golang.org/sum.golang.org module-fetch errors.
+        run: |
+          for i in 1 2 3; do
+            go install github.com/bazelbuild/bazelisk@latest && break
+            echo "bazelisk install failed (attempt $i); retrying in 10s..."
+            sleep 10
+          done
       - uses: actions/checkout@v4
       - name: Check Bazel build and tests
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
-          CARGO_BAZEL_ISOLATED: 'false'
-        run: ~/go/bin/bazelisk test //:rust_tests //:rust_clippy_check //:rust_format_check //tools:benchmark_test //tools:perf_gate_test --enable_bzlmod=true --enable_workspace=false
+        run: ~/go/bin/bazelisk test //:rust_tests //:rust_clippy_check //:rust_format_check //tools/... --enable_bzlmod=true --enable_workspace=false
 
   rust-candidate-e2e:
     name: Rust candidate E2E
     runs-on: ubuntu-latest
     steps:
+      # //tests:e2e_test queries fixture workspaces with Java targets.
       - name: Setup Java JDK
         uses: actions/setup-java@v4
         with:
@@ -47,13 +52,14 @@ jobs:
         with:
           go-version: ^1.17
       - name: Setup Bazelisk
-        # $BAZEL is the nested Bazel //tests:e2e_test spawns for each fixture
-        # workspace. Set explicitly because the fallback -- first `bazel` on
-        # PATH -- resolves to the *outer* Bazel's own binary inside a test,
-        # which ignores USE_BAZEL_VERSION. It reaches the test through the
-        # target's env_inherit.
+        # Pass Bazelisk to //tests:e2e_test so nested Bazel commands honor
+        # USE_BAZEL_VERSION instead of using the outer Bazel binary.
         run: |
-          go install github.com/bazelbuild/bazelisk@latest
+          for i in 1 2 3; do
+            go install github.com/bazelbuild/bazelisk@latest && break
+            echo "bazelisk install failed (attempt $i); retrying in 10s..."
+            sleep 10
+          done
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           echo "BAZEL=$(go env GOPATH)/bin/bazelisk" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
@@ -63,12 +69,7 @@ jobs:
           USE_BAZEL_VERSION: '8.x'
         run: bazelisk test //tests:e2e_test --enable_bzlmod=true --enable_workspace=false
 
-  # The e2e suites are split into one Bazel test target per case by
-  # //tools/e2e:regen, whose output is checked in. This job is the gate that
-  # keeps the checked-in split honest: :regen_check re-derives the case lists
-  # from the Kotlin and Rust sources and fails when they differ, so an e2e test
-  # added, renamed or removed without `make regen-e2e` cannot merge.
-  # :split_e2e_tests_test covers the generator itself.
+  # Check the generated E2E targets and the generator in //tools/e2e.
   e2e-split-regen:
     name: E2E split regen
     runs-on: ubuntu-latest
@@ -78,7 +79,13 @@ jobs:
         with:
           go-version: ^1.17
       - name: Setup Bazelisk
-        run: go install github.com/bazelbuild/bazelisk@latest
+        # Retries guard against transient proxy.golang.org/sum.golang.org module-fetch errors.
+        run: |
+          for i in 1 2 3; do
+            go install github.com/bazelbuild/bazelisk@latest && break
+            echo "bazelisk install failed (attempt $i); retrying in 10s..."
+            sleep 10
+          done
       - uses: actions/checkout@v4
       - name: Check the e2e test split is up to date
         env:
@@ -94,30 +101,28 @@ jobs:
         with:
           go-version: ^1.17
       - name: Setup Bazelisk
-        run: go install github.com/bazelbuild/bazelisk@latest
+        # Retries guard against transient proxy.golang.org/sum.golang.org module-fetch errors.
+        run: |
+          for i in 1 2 3; do
+            go install github.com/bazelbuild/bazelisk@latest && break
+            echo "bazelisk install failed (attempt $i); retrying in 10s..."
+            sleep 10
+          done
       - uses: actions/checkout@v4
-      # Builds the crate with the toolchain pinned to `rust-version` in
-      # Cargo.toml instead of the repo default. --extra_toolchains outranks the
-      # registered toolchains, which is what makes the swap take: the MSRV
-      # toolchain is declared in MODULE.bazel but deliberately not preferred.
-      # Bazel has no `cargo check` equivalent, so this is a full build -- which
-      # is strictly stronger, since it links as well as type-checks.
-      #
-      # The lint output groups are dropped because this job asks one question:
-      # does the crate still compile on the oldest Rust it claims to support.
-      # 1.85's clippy has a different lint set than the pinned toolchain's, so
-      # leaving them on would fail this job for warnings that say nothing about
-      # MSRV. //:rust_clippy_check and //:rust_format_check own that gate.
+      # Match Cargo.toml's rust-version. --extra_toolchains takes precedence
+      # over registered toolchains. Clippy and rustfmt use the default compiler.
       - name: Check declared minimum Rust version
         env:
           USE_BAZEL_VERSION: '8.x'
         run: |
           ~/go/bin/bazelisk build //src:bazel-diff \
-            --extra_toolchains=@rust_toolchains//:rust_msrv__x86_64-unknown-linux-gnu__stable \
+            --extra_toolchains=@bd_msrv//rustc:all \
             --output_groups=-clippy_checks,-rustfmt_checks \
             --enable_bzlmod=true --enable_workspace=false
 
-  test-jre21:
+  # Enforce 90% line coverage for Rust and Go on Linux and macOS.
+  coverage:
+    name: Coverage (${{ matrix.os }}, Bazel ${{ matrix.bazel }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -132,109 +137,77 @@ jobs:
           - os: macos-latest
             bazel: '9.x'
     steps:
-      - name: Setup Java JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'
       - name: Setup Go environment
         uses: actions/setup-go@v5
         with:
           go-version: ^1.17
         id: go
       - name: Setup Bazelisk
-        run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
-      - uses: actions/checkout@v4
-      - name: Free disk space on Ubuntu
-        if: runner.os == 'Linux'
+        # Retries guard against transient proxy.golang.org/sum.golang.org module-fetch errors.
         run: |
-          # //cli:E2ETest plus coverage can exhaust the default ubuntu-latest image.
-          # Reclaim space from preinstalled toolchains this job does not use.
-          # Keep /usr/local/lib/android: rules_android resolves ANDROID_HOME there.
-          sudo rm -rf /usr/share/dotnet /opt/ghc
-          sudo docker image prune --all --force || true
-          # /mnt has more headroom than / on hosted runners; keep Bazel outputs off root.
-          if [ -d /mnt ]; then
-            sudo mkdir -p /mnt/bazel-output
-            sudo chown "$USER" /mnt/bazel-output
-            echo "BAZEL_OUTPUT_USER_ROOT=/mnt/bazel-output" >> "$GITHUB_ENV"
-          fi
-          df -h / /mnt 2>/dev/null || df -h /
+          for i in 1 2 3; do
+            go install github.com/bazelbuild/bazelisk@latest && break
+            echo "bazelisk install failed (attempt $i); retrying in 10s..."
+            sleep 10
+          done
+          export PATH=$PATH:$(go env GOPATH)/bin
+      - uses: actions/checkout@v4
       - name: Build license target
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
         run: ~/go/bin/bazelisk build //:license --enable_bzlmod=true --enable_workspace=false
-      - name: Run bazel-diff tests
+      - name: Run bazel-diff tests with coverage
         env:
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
+        # Retries guard against transient toolchain/crate fetch errors failing the whole job.
         run: |
-          BAZEL_STARTUP=()
-          if [ -n "${BAZEL_OUTPUT_USER_ROOT:-}" ]; then
-            BAZEL_STARTUP=(--output_user_root="${BAZEL_OUTPUT_USER_ROOT}")
-          fi
-          ~/go/bin/bazelisk "${BAZEL_STARTUP[@]}" coverage --combined_report=lcov //cli/... //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/... --enable_bzlmod=true --enable_workspace=false
+          for i in 1 2 3; do
+            ~/go/bin/bazelisk coverage --combined_report=lcov //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/... --enable_bzlmod=true --enable_workspace=false && break
+            if [ "$i" = 3 ]; then exit 1; fi
+            echo "coverage run failed (attempt $i); retrying in 15s..."
+            sleep 15
+          done
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: coverage-report-jre21-${{ matrix.os }}-bazel-${{ matrix.bazel }}
+          name: coverage-report-${{ matrix.os }}-bazel-${{ matrix.bazel }}
           path: bazel-out/_coverage/_coverage_report.dat
           if-no-files-found: warn
       - name: Enforce coverage threshold (>= 90% main-source line coverage)
         env:
-          # Must match the `Run bazel-diff tests` step above, otherwise bazelisk
-          # downloads the default bazel from .bazelversion and starts a fresh
-          # server whose output base loses track of the coverage report symlink
-          # (seen flaking on macos-latest x bazel 9.x).
+          # Reuse the coverage step's Bazel version and output directory.
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
           COVERAGE_THRESHOLD: '90'
-        run: |
-          BAZEL_STARTUP=()
-          if [ -n "${BAZEL_OUTPUT_USER_ROOT:-}" ]; then
-            BAZEL_STARTUP=(--output_user_root="${BAZEL_OUTPUT_USER_ROOT}")
-          fi
-          ~/go/bin/bazelisk "${BAZEL_STARTUP[@]}" run //tools:coverage-check -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
+        run: ~/go/bin/bazelisk run //tools:coverage-check -- --badge-json coverage.json bazel-out/_coverage/_coverage_report.dat
       - name: Enforce Go coverage threshold (>= 90% line coverage under tools/go/)
         env:
-          # Must match the `Run bazel-diff tests` step above; see the note on the
-          # Kotlin enforcement step for why USE_BAZEL_VERSION has to be pinned here.
           USE_BAZEL_VERSION: ${{ matrix.bazel }}
-        # Gate Go independently of the Kotlin overall so thin Go coverage can't hide
-        # behind well-covered Kotlin (and vice versa). --include scopes the report to
-        # Go production source only (tools/go/, which excludes tools/coverage_check.py).
-        run: |
-          BAZEL_STARTUP=()
-          if [ -n "${BAZEL_OUTPUT_USER_ROOT:-}" ]; then
-            BAZEL_STARTUP=(--output_user_root="${BAZEL_OUTPUT_USER_ROOT}")
-          fi
-          ~/go/bin/bazelisk "${BAZEL_STARTUP[@]}" run //tools:coverage-check -- --include tools/go/ --threshold 90 bazel-out/_coverage/_coverage_report.dat
+        # Enforce coverage for tools/go/ independently of Rust coverage.
+        run: ~/go/bin/bazelisk run //tools:coverage-check -- --include tools/go/ --threshold 90 bazel-out/_coverage/_coverage_report.dat
       - name: Upload test logs
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: test-logs-jre21-${{ matrix.os }}-bazel-${{ matrix.bazel }}
+          name: test-logs-${{ matrix.os }}-bazel-${{ matrix.bazel }}
           path: bazel-testlogs/
           if-no-files-found: warn
-  test-jre11-run-example:
+  # Runs the example script end to end against this repository with supported
+  # source-build Bazel versions.
+  run-example:
+    # extra_flags distinguishes rows with the same OS and Bazel version.
+    name: Run example (${{ matrix.os }}, Bazel ${{ matrix.bazel }}, ${{ matrix.extra_flags || 'default flags' }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
-            bazel: '7.x'
-            disable_workspace: 'false'
-            extra_flags: ''
-          - os: ubuntu-latest
-            bazel: '7.x'
-            disable_workspace: 'false'
-            extra_flags: '--incompatible_disable_native_repo_rules'
-          - os: ubuntu-latest
-            bazel: '8.x'
+            bazel: '8.5.0'
             disable_workspace: 'true'
             extra_flags: ''
           - os: ubuntu-latest
-            bazel: '8.6.0rc1'
+            bazel: '8.x'
             disable_workspace: 'true'
             extra_flags: ''
           - os: ubuntu-latest
@@ -249,8 +222,6 @@ jobs:
             bazel: '9.x'
             disable_workspace: 'true'
             extra_flags: '--incompatible_disable_native_repo_rules'
-          # Skip Windows + Bazel 7.x due to protobuf compilation issues on MSVC
-          # Windows is tested with Bazel 8.x and 9.x which are more current
           - os: windows-latest
             bazel: '8.x'
             disable_workspace: 'true'
@@ -260,12 +231,6 @@ jobs:
             disable_workspace: 'true'
             extra_flags: ''
     steps:
-      - name: Setup Java JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '11'
-        id: java
       - name: Setup Go environment
         uses: actions/setup-go@v5
         with:
@@ -273,12 +238,24 @@ jobs:
         id: go
       - name: Setup Bazelisk (Linux/macOS)
         if: runner.os != 'Windows'
-        run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
+        # Retries guard against transient proxy.golang.org/sum.golang.org module-fetch errors.
+        run: |
+          for i in 1 2 3; do
+            go install github.com/bazelbuild/bazelisk@latest && break
+            echo "bazelisk install failed (attempt $i); retrying in 10s..."
+            sleep 10
+          done
+          export PATH=$PATH:$(go env GOPATH)/bin
       - name: Setup Bazelisk (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          go install github.com/bazelbuild/bazelisk@latest
+          for ($i = 1; $i -le 3; $i++) {
+            go install github.com/bazelbuild/bazelisk@latest
+            if ($LASTEXITCODE -eq 0) { break }
+            Write-Host "bazelisk install failed (attempt $i); retrying in 10s..."
+            Start-Sleep -Seconds 10
+          }
           $env:PATH = "$env:PATH;$(go env GOPATH)\bin"
           echo "$env:USERPROFILE\go\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - uses: actions/checkout@v4
@@ -291,7 +268,15 @@ jobs:
           BAZEL_DIFF_DISABLE_WORKSPACE: ${{ matrix.disable_workspace }}
           BAZEL_DIFF_FORCE_CHECKOUT: true
           BAZEL_EXTRA_COMMAND_OPTIONS: ${{ matrix.extra_flags }}
-        run: ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD)
+        # Retries guard against transient release-asset fetch errors (e.g. a 500 from
+        # GitHub Releases downloading Bazel module deps).
+        run: |
+          for i in 1 2 3; do
+            ./bazel-diff-example.sh "$GITHUB_WORKSPACE" ~/go/bin/bazelisk $(git rev-parse HEAD~1) $(git rev-parse HEAD) && break
+            if [ "$i" = 3 ]; then exit 1; fi
+            echo "example script failed (attempt $i); retrying in 15s..."
+            sleep 15
+          done
       - name: Run bazel-diff example script (Windows)
         if: runner.os == 'Windows'
         env:
@@ -300,79 +285,56 @@ jobs:
           BAZEL_DIFF_FORCE_CHECKOUT: true
           BAZEL_EXTRA_COMMAND_OPTIONS: ${{ matrix.extra_flags }}
         shell: pwsh
+        # Retries guard against transient release-asset fetch errors (e.g. a 500 from
+        # GitHub Releases downloading Bazel module deps).
+        #
+        # Keep Windows output paths short for the build and nested queries.
+        # A startup option cannot live in a --config.
         run: |
+          New-Item -ItemType Directory -Force -Path "$env:ProgramData" | Out-Null
+          Add-Content -Path "$env:ProgramData\bazel.bazelrc" -Value "startup --output_base=C:/b"
           $prevRev = git rev-parse HEAD~1
           $currRev = git rev-parse HEAD
-          .\bazel-diff-example.ps1 -WorkspacePath "$env:GITHUB_WORKSPACE" -BazelPath "$env:USERPROFILE\go\bin\bazelisk.exe" -PreviousRevision $prevRev -FinalRevision $currRev
-  # Verifies per-PR that everything a release ships still builds, on every
-  # platform it ships for. It publishes nothing: release.yaml owns that, via
-  # release_prep.sh (JAR + source archive) and its rust-binaries matrix. This
-  # job predates that flow -- it used to *be* the deploy -- so its uploads are
-  # a build check whose output happens to be downloadable, nothing more.
+          for ($i = 1; $i -le 3; $i++) {
+            .\bazel-diff-example.ps1 -WorkspacePath "$env:GITHUB_WORKSPACE" -BazelPath "$env:USERPROFILE\go\bin\bazelisk.exe" -PreviousRevision $prevRev -FinalRevision $currRev
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($i -eq 3) { exit 1 }
+            Write-Host "example script failed (attempt $i); retrying in 15s..."
+            Start-Sleep -Seconds 15
+          }
+  # Build the release assets on every PR. release.yaml publishes them.
   release-artifacts:
-    # Explicit name so the status check is stable. Left implicit, GitHub derives
-    # it from every matrix value -- which is how branch protection ended up
-    # requiring `deploy (11)`, a check that stopped existing the moment this job
-    # grew an os/rust_asset matrix. Adding a matrix key must not rename a check.
+    # Keep this check name stable for branch protection.
     name: release-artifacts (${{ matrix.os }})
-    needs: [test-jre21]
+    needs: [coverage]
     runs-on: ${{ matrix.os }}
     permissions:
-      # Read-only: nothing here attests or publishes. The id-token/attestations
-      # writes this job used to request were left over from the old deploy.
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        # rust_asset is the name //release:bazel-diff-rust gives the binary on
-        # that platform -- it is asserted, not applied (see the upload step).
-        #
-        # The two Windows-only Bazel flags can't move into --config=release:
-        # startup flags can't live in a --config at all, and .bazelrc expands
-        # platform-specific config for the bare `build` config name only.
-        # bazel_startup_flags shortens the output root because MSVC's link.exe
-        # is MAX_PATH-bound (260): under the default root, the Rust stdlib path
-        # ...rust_toolchain\lib\rustlib\x86_64-pc-windows-msvc\lib\
-        # librustc_std_workspace_alloc-<hash>.rlib comes to 263 characters and
-        # the link fails with LNK1181. C:/b buys back 35.
-        #
-        # release_config is `release-musl` on Linux: the published Linux amd64
-        # binary is statically linked against musl so it does not inherit the
-        # runner's glibc as a floor. It is a cross-compile, not a different
-        # runner, so it stays in this row. The linux-arm64 musl asset is built
-        # in extra steps on this same job (not a second matrix row) so the
-        # check name stays `release-artifacts (ubuntu-latest)`. macOS and
-        # Windows link their platform's own libc and use the plain `release`
-        # config.
+        # Match //release:bazel-diff-rust asset names. Linux configs use musl;
+        # Windows startup flags keep output paths short.
         include:
           - os: ubuntu-latest
-            java: '11'
             rust_asset: bazel-diff-rust-linux-amd64
-            release_config: release-musl
+            release_config: release-linux
             bazel_startup_flags: ''
             bazel_extra_flags: ''
-            upload_jar_and_archive: true
+            upload_archive: true
           - os: macos-latest
-            java: '11'
             rust_asset: bazel-diff-rust-macos-arm64
             release_config: release
             bazel_startup_flags: ''
             bazel_extra_flags: ''
-            upload_jar_and_archive: false
+            upload_archive: false
           - os: windows-latest
-            java: '11'
             rust_asset: bazel-diff-rust-windows-amd64.exe
             release_config: release
-            bazel_startup_flags: '--output_user_root=C:/b'
+            bazel_startup_flags: '--output_base=C:/b'
             bazel_extra_flags: '--legacy_external_runfiles'
-            upload_jar_and_archive: false
+            upload_archive: false
     steps:
-      - name: Setup Java JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: ${{ matrix.java }}
-        id: java
       - name: Setup Go environment
         uses: actions/setup-go@v5
         with:
@@ -380,70 +342,59 @@ jobs:
         id: go
       - name: Setup Bazelisk (Linux/macOS)
         if: runner.os != 'Windows'
+        # Retries guard against transient proxy.golang.org/sum.golang.org module-fetch errors.
         run: |
-          go install github.com/bazelbuild/bazelisk@latest
+          for i in 1 2 3; do
+            go install github.com/bazelbuild/bazelisk@latest && break
+            echo "bazelisk install failed (attempt $i); retrying in 10s..."
+            sleep 10
+          done
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
       - name: Setup Bazelisk (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          go install github.com/bazelbuild/bazelisk@latest
+          for ($i = 1; $i -le 3; $i++) {
+            go install github.com/bazelbuild/bazelisk@latest
+            if ($LASTEXITCODE -eq 0) { break }
+            Write-Host "bazelisk install failed (attempt $i); retrying in 10s..."
+            Start-Sleep -Seconds 10
+          }
           echo "$(go env GOPATH)\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - uses: actions/checkout@v4
-      - name: Build deployable JAR
-        if: matrix.upload_jar_and_archive
-        run: bazelisk build //cli:bazel-diff_deploy.jar
-      - uses: actions/upload-artifact@v4
-        if: matrix.upload_jar_and_archive
-        with:
-          name: bazel-diff_deploy.jar
-          path: bazel-bin/cli/bazel-diff_deploy.jar
-          if-no-files-found: error
-      # The same script release_prep.sh packs the shipped archive with, so this
-      # check can't pass on an archive the release would not produce. It used to
-      # call `make release_source_archive`, a second tar recipe that had already
-      # drifted (no __pycache__/*.pyc excludes).
+      # Use the same archive script as release_prep.sh.
       - name: Build release source archive
-        if: matrix.upload_jar_and_archive
+        if: matrix.upload_archive
         run: .github/workflows/pack_release_archive.sh archives/release.tar.gz
       - uses: actions/upload-artifact@v4
-        if: matrix.upload_jar_and_archive
+        if: matrix.upload_archive
         with:
           name: release.tar.gz
           path: archives/release.tar.gz
           if-no-files-found: error
-      # //release:bazel-diff-rust names the binary for the platform Bazel built
-      # it for, so this step neither renames nor relocates anything: whatever
-      # lands in bazel-bin/release/ is the published asset. matrix.release_config
-      # carries the flags (see .bazelrc) -- including, on Linux, the musl target
-      # platform. `if-no-files-found: error` below is the assertion that Bazel's
-      # name still matches matrix.rust_asset.
+      # .bazelrc defines release configs; //release:bazel-diff-rust names assets.
       - name: Build Rust binary
         shell: bash
         env:
-          # Windows runs this under Git bash, whose MSYS runtime rewrites any
-          # argument starting with `//package` into a `/package` Windows path --
-          # Bazel then rejects "invalid package name '/release'". (`//:target`
-          # survived only because it has no path-like segment to convert.)
+          # Prevent Git Bash from rewriting Bazel target labels as Windows paths.
           MSYS2_ARG_CONV_EXCL: '//'
         run: bazelisk ${{ matrix.bazel_startup_flags }} build //release:bazel-diff-rust --config=${{ matrix.release_config }} ${{ matrix.bazel_extra_flags }}
-      - name: Assert Linux binary is statically linked
+      - name: Validate Linux release binary
         if: runner.os == 'Linux'
-        run: .github/workflows/assert_static_binary.sh "bazel-bin/release/${{ matrix.rust_asset }}"
+        run: |
+          .github/workflows/assert_static_binary.sh "bazel-bin/release/${{ matrix.rust_asset }}"
+          "bazel-bin/release/${{ matrix.rust_asset }}" --version
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.rust_asset }}
           path: bazel-bin/release/${{ matrix.rust_asset }}
           if-no-files-found: error
-      # Second published Linux asset, built in this same job so the status check
-      # stays `release-artifacts (ubuntu-latest)`. A matrix row with the same
-      # `os` would duplicate that name and break branch protection.
-      - name: Build Rust binary (linux-arm64 musl)
+      # Keep both Linux assets in the required release-artifacts (ubuntu-latest) job.
+      - name: Build Rust binary (linux-arm64)
         if: runner.os == 'Linux'
-        run: bazelisk build //release:bazel-diff-rust --config=release-musl-arm64
-      - name: Assert Linux arm64 binary is statically linked
-        if: runner.os == 'Linux'
-        run: .github/workflows/assert_static_binary.sh bazel-bin/release/bazel-diff-rust-linux-arm64
+        run: |
+          bazelisk build //release:bazel-diff-rust --config=release-linux-arm64
+          .github/workflows/assert_static_binary.sh bazel-bin/release/bazel-diff-rust-linux-arm64
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Linux'
         with:

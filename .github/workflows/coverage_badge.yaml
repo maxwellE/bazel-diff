@@ -16,23 +16,32 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - name: Setup Java JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'
       - name: Setup Go environment
         uses: actions/setup-go@v5
         with:
           go-version: ^1.17
         id: go
       - name: Setup Bazelisk
-        run: go install github.com/bazelbuild/bazelisk@latest && export PATH=$PATH:$(go env GOPATH)/bin
+        # Retries guard against transient proxy.golang.org module-fetch errors.
+        run: |
+          for i in 1 2 3; do
+            go install github.com/bazelbuild/bazelisk@latest && break
+            echo "bazelisk install failed (attempt $i); retrying in 10s..."
+            sleep 10
+          done
+          export PATH=$PATH:$(go env GOPATH)/bin
       - uses: actions/checkout@v4
       - name: Run bazel-diff tests with coverage
         env:
           USE_BAZEL_VERSION: '9.x'
-        run: ~/go/bin/bazelisk coverage --combined_report=lcov //cli/... //src:cli_tests //src:rust_tests //tools:coverage_check_test --enable_bzlmod=true --enable_workspace=false
+        # Retries guard against transient toolchain/crate fetch errors failing the daily cron.
+        run: |
+          for i in 1 2 3; do
+            ~/go/bin/bazelisk coverage --combined_report=lcov //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... --enable_bzlmod=true --enable_workspace=false && break
+            if [ "$i" = 3 ]; then exit 1; fi
+            echo "coverage run failed (attempt $i); retrying in 15s..."
+            sleep 15
+          done
       - name: Regenerate coverage badge
         env:
           USE_BAZEL_VERSION: '9.x'

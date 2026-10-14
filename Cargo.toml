@@ -13,12 +13,19 @@ publish = false
 name = "bazel-diff"
 path = "src/main.rs"
 
+[features]
+default = ["vendored-protoc"]
+vendored-protoc = ["dep:protoc-bin-vendored"]
+
 [dependencies]
 anyhow = "1.0"
+attohttpc = { version = "=0.28.5", default-features = false, features = ["basic-auth", "tls-rustls-webpki-roots"] }
 buffa = "0.9.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 hex = "0.4"
+mimalloc = "0.1"
 rayon = "1.10"
+rustls-pki-types = "1.15"
 rust-s3 = { version = "=0.36.0", default-features = false, features = ["sync-rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -30,7 +37,7 @@ walkdir = "2.5"
 
 [build-dependencies]
 buffa-build = "0.9.1"
-protoc-bin-vendored = "3.2"
+protoc-bin-vendored = { version = "3.2", optional = true }
 
 [dev-dependencies]
 zip = { version = "2.2", default-features = false, features = ["deflate"] }

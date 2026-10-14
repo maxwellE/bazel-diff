@@ -1,4 +1,3 @@
-load("@rules_kotlin//kotlin:core.bzl", "define_kt_toolchain")
 load("@rules_license//rules:license.bzl", "license")
 load("@rules_rust//rust:defs.bzl", "rust_clippy_test", "rustfmt_test")
 
@@ -11,11 +10,22 @@ exports_files(
     visibility = ["//src:__pkg__"],
 )
 
-alias(
-    name = "bazel-diff",
-    actual = "//cli:bazel-diff",
+# The README's getting-started script. //tests:e2e_test runs it end to end
+# (tests/e2e/example.rs), so it has to reach that test as a runfile.
+exports_files(
+    ["bazel-diff-example.sh"],
+    visibility = ["//tests:__pkg__"],
 )
 
+alias(
+    name = "bazel-diff",
+    actual = "//src:bazel-diff",
+    visibility = ["//visibility:public"],
+)
+
+# Kept for consumers that adopted the Rust binary while it was published next
+# to the JVM one under this name (`bazel run @bazel-diff//:bazel-diff-rust`).
+# It is the same binary as //:bazel-diff; prefer that label.
 alias(
     name = "bazel-diff-rust",
     actual = "//src:bazel-diff",
@@ -44,8 +54,8 @@ test_suite(
 _RUST_LINT_ROOTS = [
     "//src:bazel-diff",
     "//src:bazel_diff_lib",
-    # The un-split, whole-crate e2e target (//tests:e2e_test is now a
-    # test_suite over one target per case, and the per-case targets carry
+    # The un-split, whole-crate e2e target (//tests:e2e_test is a test_suite
+    # over one target per case, and the per-case targets carry
     # no-clippy/no-rustfmt so the crate is linted once rather than 38 times).
     "//tests:e2e_test_all",
     "//tools/coverage:lcov_merger",
@@ -66,7 +76,7 @@ rustfmt_test(
 
 alias(
     name = "format",
-    actual = "//cli/format:format",
+    actual = "//tools/format:rustfmt",
 )
 
 package(
@@ -81,10 +91,5 @@ license(
     license_kind = "@rules_license//licenses/spdx:BSD-3-Clause",
     license_text = "LICENSE",
     package_url = "https://github.com/Tinder/bazel-diff",
-    package_version = "46.0.0",
-)
-
-define_kt_toolchain(
-    name = "kotlin_toolchain",
-    jvm_target = "11",
+    package_version = "50.1.0",
 )

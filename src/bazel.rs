@@ -11,6 +11,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Instant;
 use tempfile::NamedTempFile;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -73,6 +74,54 @@ impl BazelOptions {
             .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
     }
 
+    pub fn dependency_fingerprint(&self) -> Result<String> {
+        const STREAMED_VERSION: &str = "bzlmod-streamed-proto-v2";
+        const TEXT_FALLBACK_VERSION: &str = "bzlmod-show-repo-text-v1";
+        let total_start = Instant::now();
+        let mut hasher = Sha256::new();
+        if !self.is_bzlmod_enabled() {
+            hasher.update(b"mode:legacy");
+            eprintln!(
+                "[BD-DBG][fingerprint-ms] mode=legacy version={TEXT_FALLBACK_VERSION} mapping=0 show_repo=0 total={}",
+                total_start.elapsed().as_millis()
+            );
+            return Ok(hex::encode(hasher.finalize()));
+        }
+
+        hasher.update(b"mode:bzlmod\0");
+        let module_graph = self.module_graph_json().unwrap_or_default();
+        hasher.update(module_graph.as_bytes());
+        hasher.update(b"\0");
+
+        let mapping_start = Instant::now();
+        let canonical_names = self.canonical_bzlmod_repo_names()?;
+        let mapping_millis = mapping_start.elapsed().as_millis();
+
+        let show_repo_start = Instant::now();
+        let streamed = self.show_repo_streamed_proto(&canonical_names);
+        let show_repo_millis = show_repo_start.elapsed().as_millis();
+        if let Ok(repo_state) = streamed {
+            hasher.update(&repo_state);
+            eprintln!(
+                "[BD-DBG][fingerprint-ms] mode=bzlmod version={STREAMED_VERSION} mapping={mapping_millis} show_repo={show_repo_millis} total={} repoCount={} fallback=false",
+                total_start.elapsed().as_millis(),
+                canonical_names.len(),
+            );
+            return Ok(hex::encode(hasher.finalize()));
+        }
+
+        let fallback_show_repo_start = Instant::now();
+        let repo_state = self.show_repo_fingerprint_text_fallback(&canonical_names)?;
+        let fallback_show_repo_millis = fallback_show_repo_start.elapsed().as_millis();
+        hasher.update(repo_state.as_bytes());
+        eprintln!(
+            "[BD-DBG][fingerprint-ms] mode=bzlmod version={TEXT_FALLBACK_VERSION} mapping={mapping_millis} show_repo={fallback_show_repo_millis} total={} repoCount={} fallback=true",
+            total_start.elapsed().as_millis(),
+            canonical_names.len(),
+        );
+        Ok(hex::encode(hasher.finalize()))
+    }
+
     fn version(&self) -> Result<BazelVersion> {
         let output = self.run_capture(&["version"])?;
         if !output.status.success() {
@@ -100,15 +149,29 @@ impl BazelOptions {
         &self,
         mut transform: impl FnMut(&mut Target),
     ) -> Result<Vec<Target>> {
-        let bzlmod_repos = if self.is_bzlmod_enabled()
-            && self.version().is_ok_and(|version| {
-                version >= BazelVersion(8, 6, 0) && version != BazelVersion(9, 0, 0)
-            }) {
-            self.query_bzlmod_repos(&mut transform)
-                .unwrap_or_else(|error| {
-                    eprintln!("[Warn] failed to hash Bzlmod repositories: {error:#}");
-                    Vec::new()
-                })
+        let bzlmod_repos = if self.is_bzlmod_enabled() {
+            let supports_bzlmod = match self.version() {
+                Ok(version) => version >= BazelVersion(8, 6, 0) && version != BazelVersion(9, 0, 0),
+                Err(error) if self.keep_going => {
+                    eprintln!(
+                        "[Warn] failed to check Bazel version for Bzlmod repositories: {error:#}"
+                    );
+                    false
+                }
+                Err(error) => return Err(error),
+            };
+            if supports_bzlmod {
+                match self.query_bzlmod_repos(&mut transform) {
+                    Ok(repos) => repos,
+                    Err(error) if self.keep_going => {
+                        eprintln!("[Warn] failed to hash Bzlmod repositories: {error:#}");
+                        Vec::new()
+                    }
+                    Err(error) => return Err(error),
+                }
+            } else {
+                Vec::new()
+            }
         } else {
             Vec::new()
         };
@@ -187,11 +250,23 @@ impl BazelOptions {
         }
         let canonical_to_apparent =
             parse_repo_mapping(&String::from_utf8_lossy(&mapping_output.stdout));
-        let canonical_names = canonical_to_apparent
+        let module_graph = self.module_graph_json();
+        let module_edges = match &module_graph {
+            Some(json) => parse_module_dependency_edges(json),
+            None if self.keep_going => BTreeMap::new(),
+            None => bail!("bazel mod graph --output=json failed"),
+        };
+        let mut canonical_names = canonical_to_apparent
             .keys()
             .filter(|name| name.contains('+') || name.contains('~'))
             .map(|name| format!("@@{name}"))
             .collect::<Vec<_>>();
+        // Modules the root does not declare (e.g. one only a dependency pulls in under its own
+        // apparent name) are absent from the root's repo mapping, yet sit on the path between
+        // root-visible repos. Ask for them by module key so that path stays connected (#510).
+        if let Some(json) = &module_graph {
+            canonical_names.extend(hidden_module_keys(json, &canonical_to_apparent));
+        }
         if canonical_names.is_empty() {
             return Ok(Vec::new());
         }
@@ -211,11 +286,6 @@ impl BazelOptions {
             bail!("bazel mod show_repo failed with {}", output.status);
         }
         let repositories = decode_delimited::<Repository>(output_file.path())?;
-        let module_edges = self
-            .module_graph_json()
-            .as_deref()
-            .map(parse_module_dependency_edges)
-            .unwrap_or_default();
         Ok(lower_repositories(
             repositories,
             &canonical_to_apparent,
@@ -352,6 +422,87 @@ impl BazelOptions {
             .map(str::to_owned)
             .collect())
     }
+
+    fn canonical_bzlmod_repo_names(&self) -> Result<Vec<String>> {
+        let mapping_output = self.run_capture(&["mod", "dump_repo_mapping", ""])?;
+        if !mapping_output.status.success() {
+            bail!("bazel mod dump_repo_mapping failed");
+        }
+        Ok(
+            parse_repo_mapping(&String::from_utf8_lossy(&mapping_output.stdout))
+                .keys()
+                .filter(|name| name.contains('+') || name.contains('~'))
+                .map(|name| format!("@@{name}"))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn show_repo_streamed_proto(&self, canonical_names: &[String]) -> Result<Vec<u8>> {
+        if canonical_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut command = self.command();
+        command
+            .arg("mod")
+            .arg("show_repo")
+            .args(canonical_names)
+            .arg("--output=streamed_proto")
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped());
+        eprintln!("[BD-DBG][fingerprint-command] path=streamed_proto_selected cmd={command:?}");
+        if self.verbose {
+            eprintln!("[Info] Command: {command:?}");
+        }
+        let output = command
+            .output()
+            .context("execute bazel mod show_repo streamed_proto")?;
+        if !output.status.success() {
+            bail!(
+                "bazel mod show_repo --output=streamed_proto failed with {}",
+                output.status
+            );
+        }
+        Ok(output.stdout)
+    }
+
+    fn show_repo_fingerprint_text_fallback(&self, canonical_names: &[String]) -> Result<String> {
+        let mut all_visible_command = self.command();
+        all_visible_command
+            .arg("mod")
+            .arg("show_repo")
+            .arg("--all_visible_repos")
+            .arg("--output=text");
+        eprintln!(
+            "[BD-DBG][fingerprint-command] path=text_all_visible cmd={all_visible_command:?}"
+        );
+        let output = all_visible_command
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .output();
+        if let Ok(output) = output {
+            if output.status.success() {
+                return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+            }
+        }
+
+        let mut command = self.command();
+        command.arg("mod").arg("show_repo");
+        if canonical_names.is_empty() {
+            command.arg("--output=text");
+        } else {
+            command.args(canonical_names).arg("--output=text");
+        }
+        eprintln!("[BD-DBG][fingerprint-command] path=text_selected_repos cmd={command:?}");
+        command.stdin(Stdio::null()).stderr(Stdio::piped());
+        let output = command.output().context("execute bazel mod show_repo")?;
+        if !output.stderr.is_empty() && self.verbose {
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        }
+        if !output.status.success() {
+            bail!("bazel mod show_repo failed with {}", output.status);
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
 }
 
 fn parse_repo_mapping(text: &str) -> BTreeMap<String, Vec<String>> {
@@ -412,8 +563,14 @@ fn lower_repositories(
             .into_iter()
             .flat_map(|module| module_edges.get(module).into_iter().flatten())
             .filter_map(|dependency| module_to_canonical.get(dependency))
-            .flat_map(|canonical| canonical_to_apparent.get(canonical).into_iter().flatten())
-            .cloned()
+            .flat_map(|canonical| {
+                // A module the root cannot see has no apparent name there; its node is named
+                // by canonical name, matching the `apparent_names` fallback below.
+                canonical_to_apparent
+                    .get(canonical)
+                    .cloned()
+                    .unwrap_or_else(|| vec![canonical.clone()])
+            })
             .collect::<BTreeSet<_>>();
         let apparent_names = canonical_to_apparent
             .get(canonical)
@@ -946,6 +1103,50 @@ fn parse_module_dependency_edges(json: &str) -> BTreeMap<String, BTreeSet<String
     break_module_cycles(edges)
 }
 
+/// Module keys (`name@version`, as `bazel mod show_repo` accepts them) of every module in the
+/// resolved graph whose repository is not in the root's repo mapping.
+fn hidden_module_keys(
+    json: &str,
+    canonical_to_apparent: &BTreeMap<String, Vec<String>>,
+) -> BTreeSet<String> {
+    fn walk(value: &serde_json::Value, keys: &mut BTreeMap<String, String>) {
+        let Some(object) = value.as_object() else {
+            return;
+        };
+        if let (Some(key), Some(name)) = (
+            object.get("key").and_then(serde_json::Value::as_str),
+            object.get("name").and_then(serde_json::Value::as_str),
+        ) {
+            if key != "<root>" {
+                keys.insert(key.to_owned(), name.to_owned());
+            }
+        }
+        for dependency in object
+            .get("dependencies")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            walk(dependency, keys);
+        }
+    }
+    let start = json.find('{').unwrap_or(json.len());
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&json[start..]) else {
+        return BTreeSet::new();
+    };
+    let mut keys = BTreeMap::new();
+    walk(&value, &mut keys);
+    let visible_modules = canonical_to_apparent
+        .keys()
+        .filter(|canonical| canonical.matches('+').count() == 1)
+        .filter_map(|canonical| canonical.split('+').next())
+        .collect::<BTreeSet<_>>();
+    keys.into_iter()
+        .filter(|(_, name)| !visible_modules.contains(name.as_str()))
+        .map(|(key, _)| key)
+        .collect()
+}
+
 fn break_module_cycles(
     edges: BTreeMap<String, BTreeSet<String>>,
 ) -> BTreeMap<String, BTreeSet<String>> {
@@ -1000,6 +1201,8 @@ mod tests {
     use super::*;
     use crate::proto::analysis::{Configuration, ConfiguredTarget, CqueryResult};
     use crate::proto::blaze_query::{attribute, EnvironmentGroup, GeneratedFile, SourceFile};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn rule_target(name: &str) -> Target {
         let mut target = Target::default();
@@ -1529,6 +1732,205 @@ mod tests {
         assert_eq!(dep.rule_class, "http_archive");
         assert_eq!(dep.rule_input, ["//external:child"]);
     }
+
+    #[test]
+    fn modules_hidden_from_the_root_stay_on_the_repository_path() {
+        // Issue #510: root -> facade -> middle (apparent name only inside facade) -> leaf.
+        let mapping = parse_repo_mapping(
+            r#"{"":"","facade":"facade+","leaf":"leaf+","ext_repo":"+ext+repo","bazel_tools":"bazel_tools"}"#,
+        );
+        let graph = r#"{
+          "key":"<root>","name":"root","dependencies":[
+            {"key":"facade@_","name":"facade","dependencies":[
+              {"key":"middle@_","name":"middle","dependencies":[
+                {"key":"leaf@_","name":"leaf","dependencies":[]}]}]},
+            {"key":"leaf@_","name":"leaf","dependencies":[]}
+          ]
+        }"#;
+        assert_eq!(
+            hidden_module_keys(graph, &mapping),
+            BTreeSet::from(["middle@_".to_owned()])
+        );
+        assert!(hidden_module_keys("not json", &mapping).is_empty());
+
+        let repositories = ["facade+", "middle+", "leaf+"]
+            .into_iter()
+            .map(|canonical| Repository {
+                canonical_name: Some(canonical.into()),
+                repo_rule_name: Some("http_archive".into()),
+                ..Default::default()
+            })
+            .collect();
+        let targets = lower_repositories(
+            repositories,
+            &mapping,
+            &parse_module_dependency_edges(graph),
+            Path::new("."),
+            &mut |_| {},
+        );
+        let inputs = |name: &str| {
+            targets
+                .iter()
+                .find(|target| target_name(target) == Some(name))
+                .unwrap()
+                .rule
+                .as_option()
+                .unwrap()
+                .rule_input
+                .clone()
+        };
+        assert_eq!(inputs("//external:facade"), ["//external:middle+"]);
+        assert_eq!(inputs("//external:middle+"), ["//external:leaf"]);
+        assert!(inputs("//external:leaf").is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dependency_fingerprint_fallback_chain_covers_streamed_and_text_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(
+            workspace.path().join("MODULE.bazel"),
+            "module(name = \"test\")\n",
+        )
+        .unwrap();
+
+        let selected_repos_marker = workspace.path().join("selected-repos-called");
+        let script = workspace.path().join("fake-bazel.sh");
+        let body = format!(
+            r#"#!/bin/sh
+args="$*"
+if echo "$args" | grep -q "mod graph --output=json"; then
+  printf '{{"modules":["m"]}}\n'
+  exit 0
+fi
+if echo "$args" | grep -q "mod graph"; then
+  echo "root"
+  exit 0
+fi
+if echo "$args" | grep -q "mod dump_repo_mapping"; then
+  echo '{{"pip":"rules_python+0.31.0","local":"local~override","main":"main"}}'
+  exit 0
+fi
+if echo "$args" | grep -q "mod show_repo" && echo "$args" | grep -q -- "--output=streamed_proto"; then
+  exit 2
+fi
+if echo "$args" | grep -q "mod show_repo" && echo "$args" | grep -q -- "--all_visible_repos" && echo "$args" | grep -q -- "--output=text"; then
+  exit 3
+fi
+if echo "$args" | grep -q "mod show_repo" && echo "$args" | grep -q -- "--output=text"; then
+  : > "{}"
+  echo "selected-repos-text"
+  exit 0
+fi
+exit 1
+"#,
+            selected_repos_marker.display(),
+        );
+        fs::write(&script, body).unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let options = BazelOptions {
+            workspace: workspace.path().to_path_buf(),
+            bazel: script,
+            startup_options: Vec::new(),
+            command_options: Vec::new(),
+            cquery_options: Vec::new(),
+            use_cquery: false,
+            cquery_expression: None,
+            keep_going: false,
+            fine_grained_external_repos: BTreeSet::new(),
+            exclude_external_targets: false,
+            exclude_targets_query: None,
+            no_bazelrc: false,
+            verbose: false,
+        };
+
+        let fingerprint = options.dependency_fingerprint().unwrap();
+        assert_eq!(fingerprint.len(), 64);
+        assert!(fingerprint
+            .chars()
+            .all(|character| character.is_ascii_hexdigit()));
+        assert!(selected_repos_marker.is_file());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn query_bzlmod_repos_honors_keep_going() {
+        let workspace = tempfile::tempdir().unwrap();
+        let query_proto = workspace.path().join("query-result.pb");
+        write_delimited(&query_proto, &[rule_target("//app:lib")]);
+
+        // Fake Bazel where `mod graph` succeeds (`is_bzlmod_enabled()` is true),
+        // `version` returns 8.6.1, `mod dump_repo_mapping` returns an external repo,
+        // `mod show_repo` fails, and `query` writes `//app:lib` to `--output_file`.
+        let show_repo_fail_script = workspace.path().join("fake-bazel-show-repo-fail.sh");
+        let body = format!(
+            r#"#!/bin/sh
+args="$*"
+if echo "$args" | grep -q "mod graph"; then
+  echo "root"
+  exit 0
+fi
+if echo "$args" | grep -q "version"; then
+  echo "Build label: 8.6.1"
+  exit 0
+fi
+if echo "$args" | grep -q "mod dump_repo_mapping"; then
+  echo '{{"pip":"rules_python+0.31.0"}}'
+  exit 0
+fi
+if echo "$args" | grep -q "mod show_repo"; then
+  echo "transient fetch failure" >&2
+  exit 2
+fi
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output_file" ]; then
+    cp "{}" "$2"
+    exit 0
+  fi
+  shift
+done
+exit 1
+"#,
+            query_proto.display(),
+        );
+        fs::write(&show_repo_fail_script, body).unwrap();
+        let mut permissions = fs::metadata(&show_repo_fail_script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&show_repo_fail_script, permissions).unwrap();
+
+        let mut options = BazelOptions {
+            workspace: workspace.path().to_path_buf(),
+            bazel: show_repo_fail_script,
+            startup_options: Vec::new(),
+            command_options: Vec::new(),
+            cquery_options: Vec::new(),
+            use_cquery: false,
+            cquery_expression: None,
+            keep_going: false,
+            fine_grained_external_repos: BTreeSet::new(),
+            exclude_external_targets: true,
+            exclude_targets_query: None,
+            no_bazelrc: false,
+            verbose: false,
+        };
+
+        let show_repo_err = options.query_all_targets().unwrap_err();
+        assert!(show_repo_err
+            .to_string()
+            .contains("bazel mod show_repo failed"));
+
+        // With `keep_going = true`, `query_all_targets` logs a warning and falls back to main targets.
+        options.keep_going = true;
+        let targets = options.query_all_targets().unwrap();
+        assert_eq!(
+            targets.iter().filter_map(target_name).collect::<Vec<_>>(),
+            ["//app:lib"]
+        );
+    }
+
     fn configured(
         target: Target,
         checksum: Option<&str>,

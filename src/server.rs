@@ -1,16 +1,19 @@
-use crate::hash::{generate_hashes, HashOptions};
+use crate::hash::{generate_hashes_timed, HashOptions};
 use crate::model::{
     filter_and_sort_labels, impacted_targets, impacted_targets_with_distances, HashFileData,
 };
 use crate::module_graph::impacted_with_module_changes;
 use anyhow::{anyhow, bail, Context, Result};
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::CertificateDer;
 use s3::creds::Credentials;
 use s3::request::ResponseData;
 use s3::{Bucket, Region};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashSet};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -18,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
-use url::form_urlencoded;
+use url::{form_urlencoded, Url};
 
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
@@ -28,6 +31,8 @@ pub struct ServerConfig {
     pub request_timeout: Duration,
     pub cache_dir: PathBuf,
     pub track_deps: bool,
+    /// Opt-in: guard cache hits with a fingerprint of the workspace's external-dependency state.
+    pub dependency_fingerprint: bool,
     pub no_initial_fetch: bool,
     pub warmup_revisions: Vec<String>,
     pub cache_max_age: Option<Duration>,
@@ -40,6 +45,11 @@ pub struct ServerConfig {
     pub s3_region: Option<String>,
     pub s3_endpoint: Option<String>,
     pub s3_force_path_style: bool,
+    pub nexus_url: Option<String>,
+    pub nexus_repository: Option<String>,
+    pub nexus_prefix: String,
+    pub nexus_credentials: Option<NexusCredentials>,
+    pub nexus_ca_cert: Option<PathBuf>,
 }
 
 struct State {
@@ -51,16 +61,51 @@ struct State {
     remote: Option<RemoteCache>,
 }
 
-struct RemoteCache {
-    bucket: Box<Bucket>,
-    prefix: String,
+/// The shared cache tier behind local disk. Every backend degrades the same way: a failed read is
+/// a miss (the revision is regenerated) and a failed write leaves the entry local-only, so an
+/// outage of the shared store costs throughput, never availability.
+enum RemoteCache {
+    S3(S3Cache),
+    Nexus(Box<NexusCache>),
 }
 
 impl RemoteCache {
     fn new(config: &ServerConfig) -> Result<Option<Self>> {
-        let Some(bucket_name) = &config.s3_bucket else {
-            return Ok(None);
-        };
+        if let Some(bucket_name) = &config.s3_bucket {
+            return Ok(Some(Self::S3(S3Cache::new(config, bucket_name)?)));
+        }
+        if let (Some(url), Some(repository)) = (&config.nexus_url, &config.nexus_repository) {
+            return Ok(Some(Self::Nexus(Box::new(NexusCache::new(
+                nexus_base_url(url, repository, &config.nexus_prefix)?,
+                config.nexus_credentials.clone(),
+                config.nexus_ca_cert.as_deref(),
+            )?))));
+        }
+        Ok(None)
+    }
+
+    fn get(&self, key: &str) -> Option<Vec<u8>> {
+        match self {
+            Self::S3(cache) => cache.get(key),
+            Self::Nexus(cache) => cache.get(key),
+        }
+    }
+
+    fn put(&self, key: &str, data: &[u8]) {
+        match self {
+            Self::S3(cache) => cache.put(key, data),
+            Self::Nexus(cache) => cache.put(key, data),
+        }
+    }
+}
+
+struct S3Cache {
+    bucket: Box<Bucket>,
+    prefix: String,
+}
+
+impl S3Cache {
+    fn new(config: &ServerConfig, bucket_name: &str) -> Result<Self> {
         let region_name = config
             .s3_region
             .clone()
@@ -80,10 +125,10 @@ impl RemoteCache {
         if config.s3_force_path_style {
             bucket = bucket.with_path_style();
         }
-        Ok(Some(Self {
+        Ok(Self {
             bucket,
             prefix: normalize_s3_prefix(&config.s3_prefix),
-        }))
+        })
     }
 
     fn object_key(&self, key: &str) -> String {
@@ -146,6 +191,174 @@ fn normalize_s3_prefix(prefix: &str) -> String {
     } else {
         format!("{trimmed}/")
     }
+}
+
+/// Username and password (or a Nexus user token's name and pass codes) for HTTP basic auth.
+#[derive(Clone)]
+pub struct NexusCredentials {
+    pub username: String,
+    pub password: String,
+}
+
+impl fmt::Debug for NexusCredentials {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NexusCredentials")
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Cache entries stored as components of a Sonatype Nexus Repository *raw* hosted repository,
+/// addressed through Nexus's plain HTTP content API: `GET`/`PUT` on
+/// `<nexusUrl>/repository/<repository>/<prefix>/<key>.json`.
+struct NexusCache {
+    session: attohttpc::Session,
+    base: Url,
+    credentials: Option<NexusCredentials>,
+}
+
+const NEXUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const NEXUS_READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// Bounds how much of an error body (Nexus answers many failures with a full HTML page) is
+/// echoed into a warning.
+const NEXUS_ERROR_BODY_LIMIT: usize = 200;
+
+impl NexusCache {
+    fn new(
+        base: Url,
+        credentials: Option<NexusCredentials>,
+        ca_cert: Option<&Path>,
+    ) -> Result<Self> {
+        let mut session = attohttpc::Session::new();
+        session.connect_timeout(NEXUS_CONNECT_TIMEOUT);
+        session.read_timeout(NEXUS_READ_TIMEOUT);
+        // A redirect is reported, never followed: following one would replay the basic-auth
+        // header against whatever host the `Location` names.
+        session.follow_redirects(false);
+        if let Some(path) = ca_cert {
+            for certificate in read_pem_certificates(path)? {
+                session.add_root_certificate(certificate);
+            }
+        }
+        Ok(Self {
+            session,
+            base,
+            credentials,
+        })
+    }
+
+    fn object_url(&self, key: &str) -> Url {
+        let mut url = self.base.clone();
+        url.path_segments_mut()
+            .expect("validated by nexus_base_url")
+            .pop_if_empty()
+            .push(&format!("{key}.json"));
+        url
+    }
+
+    fn authorized<B>(&self, request: attohttpc::RequestBuilder<B>) -> attohttpc::RequestBuilder<B> {
+        match &self.credentials {
+            Some(credentials) => {
+                request.basic_auth(&credentials.username, Some(&credentials.password))
+            }
+            None => request,
+        }
+    }
+
+    /// Reads an entry, degrading to a miss on any failure. Nexus answers a missing component with
+    /// a plain `404`.
+    fn get(&self, key: &str) -> Option<Vec<u8>> {
+        let url = self.object_url(key);
+        let failure = match self.authorized(self.session.get(url.as_str())).send() {
+            Ok(response) if response.status() == attohttpc::StatusCode::OK => {
+                match response.bytes() {
+                    Ok(bytes) => return Some(bytes),
+                    Err(error) => error.to_string(),
+                }
+            }
+            Ok(response) if response.status() == attohttpc::StatusCode::NOT_FOUND => return None,
+            Ok(response) => nexus_http_failure(response),
+            Err(error) => error.to_string(),
+        };
+        eprintln!("[Warn] Nexus cache read of {url} failed (treating as a miss): {failure}");
+        None
+    }
+
+    fn put(&self, key: &str, data: &[u8]) {
+        let url = self.object_url(key);
+        let failure = match self
+            .authorized(self.session.put(url.as_str()))
+            .header(attohttpc::header::CONTENT_TYPE, "application/json")
+            .bytes(data)
+            .send()
+        {
+            Ok(response) if response.is_success() => return,
+            Ok(response) if response.status() == attohttpc::StatusCode::BAD_REQUEST => format!(
+                "{} (a raw hosted repository answers 400 when its deployment policy forbids \
+                 redeploying an existing component; set it to \"Allow redeploy\")",
+                nexus_http_failure(response)
+            ),
+            Ok(response) => nexus_http_failure(response),
+            Err(error) => error.to_string(),
+        };
+        eprintln!("[Warn] Nexus cache write of {url} failed (entry not shared): {failure}");
+    }
+}
+
+fn nexus_http_failure(response: attohttpc::Response) -> String {
+    let status = response.status().as_u16();
+    let body = response.text().unwrap_or_default();
+    let body = body.trim();
+    let shown = match body.char_indices().nth(NEXUS_ERROR_BODY_LIMIT) {
+        Some((cut, _)) => format!("{}...", &body[..cut]),
+        None => body.to_owned(),
+    };
+    format!("Got HTTP {status} with content '{shown}'")
+}
+
+/// Resolves the directory URL every entry lives under:
+/// `<url>/repository/<repository>/<prefix>/`. `url` is the Nexus base URL, including any context
+/// path Nexus is served under (`https://host/nexus`). Shared with the CLI, which renders it as the
+/// `remote` cache location in `/metrics`.
+pub fn nexus_base_url(url: &str, repository: &str, prefix: &str) -> Result<Url> {
+    let mut base = Url::parse(url).with_context(|| format!("invalid Nexus URL {url:?}"))?;
+    if !matches!(base.scheme(), "http" | "https") {
+        bail!("Nexus URL must be http or https: {url}");
+    }
+    if !base.username().is_empty() || base.password().is_some() {
+        bail!(
+            "Nexus URL must not embed credentials; use --nexusUsername and \
+             BAZEL_DIFF_NEXUS_PASSWORD"
+        );
+    }
+    if repository.is_empty() || repository.contains('/') {
+        bail!("Nexus repository must be a single non-empty name: {repository:?}");
+    }
+    base.set_query(None);
+    base.set_fragment(None);
+    {
+        let mut segments = base
+            .path_segments_mut()
+            .map_err(|()| anyhow!("invalid Nexus URL {url:?}"))?;
+        segments.pop_if_empty().push("repository").push(repository);
+        segments.extend(prefix.split('/').filter(|segment| !segment.is_empty()));
+        segments.push("");
+    }
+    Ok(base)
+}
+
+fn read_pem_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
+    let pem = fs::read(path)
+        .with_context(|| format!("failed to read Nexus CA certificate {}", path.display()))?;
+    let certificates = CertificateDer::pem_slice_iter(&pem)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| anyhow!("invalid PEM in {}: {error:?}", path.display()))?;
+    if certificates.is_empty() {
+        bail!("no PEM certificates found in {}", path.display());
+    }
+    Ok(certificates)
 }
 
 #[derive(Debug, Deserialize)]
@@ -250,22 +463,7 @@ pub fn serve(config: ServerConfig) -> Result<()> {
     });
     prune_cache(&state)?;
     start_cache_pruner(&state)?;
-    if !state.config.no_initial_fetch {
-        git(
-            &state,
-            &[
-                String::from("fetch"),
-                String::from("--all"),
-                String::from("--tags"),
-            ],
-        )?;
-    }
-    for revision in &state.config.warmup_revisions {
-        if let Err(error) = warm_revision(&state, revision) {
-            eprintln!("[Warn] failed to warm revision {revision}: {error:#}");
-        }
-    }
-    state.ready.store(true, Ordering::Release);
+    perform_initial_fetch(&state);
     let server = Server::http(("0.0.0.0", state.config.port))
         .map_err(|error| anyhow!("failed to bind HTTP server: {error}"))?;
     eprintln!(
@@ -277,6 +475,32 @@ pub fn serve(config: ServerConfig) -> Result<()> {
         std::thread::spawn(move || handle_request(request, state));
     }
     Ok(())
+}
+
+/// Performs the startup git fetch (unless `--noInitialFetch`) and warmup, then flips `ready`
+/// once the clone is known good. On a fetch failure the server is left running but un-ready
+/// ("lame duck") so `/health` reports 503 and a load balancer removes the instance rather than
+/// us attempting a risky in-place repair; `/metrics` keeps answering with `ready: false`.
+fn perform_initial_fetch(state: &Arc<State>) {
+    if !state.config.no_initial_fetch {
+        let fetch = [
+            String::from("fetch"),
+            String::from("--all"),
+            String::from("--tags"),
+        ];
+        if let Err(error) = git(state, &fetch) {
+            eprintln!(
+                "[Error] initial git fetch failed; server is lame-ducked (health will report NOT_READY): {error:#}"
+            );
+            return;
+        }
+    }
+    for revision in &state.config.warmup_revisions {
+        if let Err(error) = warm_revision(state, revision) {
+            eprintln!("[Warn] failed to warm revision {revision}: {error:#}");
+        }
+    }
+    state.ready.store(true, Ordering::Release);
 }
 
 fn start_cache_pruner(state: &Arc<State>) -> Result<()> {
@@ -480,16 +704,18 @@ fn compute_query(state: &Arc<State>, inputs: QueryInputs, kind: QueryKind) -> Re
         // Same graph generate-hashes writes to --depEdgesFile: the end revision's
         // full (unscoped) dependency map. modifiedFilepaths must not shrink it —
         // PRI/CRI BFS-walk this file from the app target and need every edge.
-        let (to, _) = get_hashes_locked(state, &to_sha, &BTreeSet::new())?;
+        let to = get_hashes_locked(state, &to_sha, &BTreeSet::new())?.data;
         prune_cache(state)?;
         return Ok(serde_json::to_value(&to.dep_edges)?);
     }
     let from_started = Instant::now();
-    let (from, from_hit) = get_hashes_locked(state, &from_sha, &inputs.modified_filepaths)?;
-    let from_millis = from_started.elapsed().as_millis() as u64;
+    let from = get_hashes_locked(state, &from_sha, &inputs.modified_filepaths)?;
+    let from_profile = retrieval_profile(&from_sha, &from, from_started);
+    let from = from.data;
     let to_started = Instant::now();
-    let (to, to_hit) = get_hashes_locked(state, &to_sha, &inputs.modified_filepaths)?;
-    let to_millis = to_started.elapsed().as_millis() as u64;
+    let to = get_hashes_locked(state, &to_sha, &inputs.modified_filepaths)?;
+    let to_profile = retrieval_profile(&to_sha, &to, to_started);
+    let to = to.data;
     let diff_started = Instant::now();
     checkout(state, &to_sha)?;
     let exclude_external = state.config.hash_options.bazel.is_bzlmod_enabled();
@@ -531,10 +757,7 @@ fn compute_query(state: &Arc<State>, inputs: QueryInputs, kind: QueryKind) -> Re
             json!({
                 "totalDurationMillis": started.elapsed().as_millis() as u64,
                 "resolveRevisionsDurationMillis": resolve_millis,
-                "hashRetrievals": [
-                    {"sha": from_sha, "cacheHit": from_hit, "durationMillis": from_millis},
-                    {"sha": to_sha, "cacheHit": to_hit, "durationMillis": to_millis}
-                ],
+                "hashRetrievals": [from_profile, to_profile],
                 "diffDurationMillis": diff_millis,
                 "diffModuleGraphChanged": from.module_graph_json != to.module_graph_json
             }),
@@ -566,30 +789,138 @@ fn warm_revision(state: &Arc<State>, revision: &str) -> Result<()> {
     Ok(())
 }
 
+/// Wall-clock breakdown of one cache-miss hash generation, in pipeline order: the `git
+/// checkout`, then the phases of [`generate_hashes_timed`], then serialising the result and
+/// writing it to the cache tiers. `targetCount` sizes the graph the phases operated on. Field
+/// names match the profile the Kotlin service emitted, which tools/serve_harness.py asserts on.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerationBreakdown {
+    checkout_millis: u64,
+    bazel_query_millis: u64,
+    target_hash_millis: u64,
+    module_graph_millis: u64,
+    cache_write_millis: u64,
+    target_count: usize,
+}
+
+/// Outcome of one cache lookup: the data, whether it was served from a cache tier, and where the
+/// time went. A hit carries only `cache_read_millis` (reading and deserialising the entry is the
+/// whole cost of a hit); a miss carries only `generation`.
+struct Retrieval {
+    data: HashFileData,
+    cache_hit: bool,
+    cache_read_millis: Option<u64>,
+    generation: Option<GenerationBreakdown>,
+}
+
+impl Retrieval {
+    fn hit(data: HashFileData, read_started: Instant) -> Self {
+        Self {
+            data,
+            cache_hit: true,
+            cache_read_millis: Some(elapsed_millis(read_started)),
+            generation: None,
+        }
+    }
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    started.elapsed().as_millis() as u64
+}
+
+/// One `profile.hashRetrievals[]` entry. Optional phases are omitted rather than nulled so a hit
+/// never shows a `generation` key and a miss never shows `cacheReadMillis`.
+fn retrieval_profile(sha: &str, retrieval: &Retrieval, started: Instant) -> Value {
+    let mut entry = serde_json::Map::from_iter([
+        ("sha".to_owned(), Value::String(sha.to_owned())),
+        ("cacheHit".to_owned(), Value::Bool(retrieval.cache_hit)),
+        (
+            "durationMillis".to_owned(),
+            Value::from(elapsed_millis(started)),
+        ),
+    ]);
+    if let Some(millis) = retrieval.cache_read_millis {
+        entry.insert("cacheReadMillis".to_owned(), Value::from(millis));
+    }
+    if let Some(generation) = &retrieval.generation {
+        entry.insert(
+            "generation".to_owned(),
+            serde_json::to_value(generation).unwrap_or(Value::Null),
+        );
+    }
+    Value::Object(entry)
+}
+
 fn get_hashes_locked(
     state: &Arc<State>,
     sha: &str,
     modified: &BTreeSet<PathBuf>,
-) -> Result<(HashFileData, bool)> {
+) -> Result<Retrieval> {
     let key = cache_key(state, sha, modified);
     let path = state.config.cache_dir.join(format!("{key}.json"));
+    let mut current_dependency_fingerprint = None;
     if path.is_file() {
+        let read_started = Instant::now();
         let data = HashFileData::read(&path)?;
-        touch(&path);
-        return Ok((data, true));
-    }
-    if let Some(remote) = &state.remote {
-        if let Some(bytes) = remote.get(&key) {
-            let data = HashFileData::from_slice(&bytes)?;
-            fs::write(&path, &bytes)?;
-            return Ok((data, true));
+        if cache_entry_is_servable(
+            state,
+            sha,
+            "local",
+            &key,
+            &data,
+            &mut current_dependency_fingerprint,
+        )? {
+            touch(&path);
+            return Ok(Retrieval::hit(data, read_started));
         }
     }
+    if let Some(remote) = &state.remote {
+        let read_started = Instant::now();
+        if let Some(bytes) = remote.get(&key) {
+            let data = HashFileData::from_slice(&bytes)?;
+            if cache_entry_is_servable(
+                state,
+                sha,
+                "remote",
+                &key,
+                &data,
+                &mut current_dependency_fingerprint,
+            )? {
+                fs::write(&path, &bytes)?;
+                return Ok(Retrieval::hit(data, read_started));
+            }
+        }
+    }
+    if state.config.dependency_fingerprint {
+        eprintln!("[BD-DBG][cache-recompute] sha={sha} key={key}");
+    }
+    let checkout_started = Instant::now();
     checkout(state, sha)?;
+    let checkout_millis = elapsed_millis(checkout_started);
     let mut options = state.config.hash_options.clone();
     options.modified_filepaths = modified.clone();
     options.track_deps = state.config.track_deps;
-    let data = generate_hashes(&options)?;
+    let (mut data, timings) = generate_hashes_timed(&options)?;
+    if state.config.dependency_fingerprint {
+        data.dependency_fingerprint = current_dependency_fingerprint.take().or_else(|| {
+            match dependency_fingerprint_for_workspace(state) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    eprintln!("[Warn] {error:#}");
+                    None
+                }
+            }
+        });
+        match data.dependency_fingerprint.as_deref() {
+            Some(fingerprint) => eprintln!(
+                "[BD-DBG][cache-write-fingerprint] sha={sha} key={key} fp={}",
+                short_fingerprint(fingerprint)
+            ),
+            None => eprintln!("[BD-DBG][cache-write-fingerprint] sha={sha} key={key} fp=NONE"),
+        }
+    }
+    let write_started = Instant::now();
     let bytes = serde_json::to_vec(&data.serialized(true, state.config.track_deps))?;
     let temporary = state.config.cache_dir.join(format!("{key}.tmp"));
     fs::write(&temporary, bytes)?;
@@ -598,7 +929,120 @@ fn get_hashes_locked(
         let bytes = fs::read(state.config.cache_dir.join(format!("{key}.json")))?;
         remote.put(&key, &bytes);
     }
-    Ok((data, false))
+    let generation = GenerationBreakdown {
+        checkout_millis,
+        bazel_query_millis: timings.bazel_query_millis,
+        target_hash_millis: timings.target_hash_millis,
+        module_graph_millis: timings.module_graph_millis,
+        cache_write_millis: elapsed_millis(write_started),
+        target_count: data.hashes.len(),
+    };
+    // Always logged, not just for profile=true requests, so a slow generation is attributable to
+    // a phase straight from the server log.
+    eprintln!(
+        "[Info] generated hashes for {sha}: checkout={}ms bazelQuery={}ms targetHash={}ms moduleGraph={}ms cacheWrite={}ms targets={}",
+        generation.checkout_millis,
+        generation.bazel_query_millis,
+        generation.target_hash_millis,
+        generation.module_graph_millis,
+        generation.cache_write_millis,
+        generation.target_count
+    );
+    Ok(Retrieval {
+        data,
+        cache_hit: false,
+        cache_read_millis: None,
+        generation: Some(generation),
+    })
+}
+
+/// Decides whether a cached entry may be served for `sha`.
+///
+/// Without `--dependencyFingerprint` every entry is trusted, as it was before the guard existed:
+/// the cache key already covers the SHA and the hash-affecting configuration. With the flag on,
+/// the entry must carry a dependency fingerprint that matches the workspace's current
+/// external-dependency state, which costs a checkout plus `bazel mod` calls per lookup.
+fn cache_entry_is_servable(
+    state: &Arc<State>,
+    sha: &str,
+    scope: &str,
+    key: &str,
+    data: &HashFileData,
+    current_dependency_fingerprint: &mut Option<String>,
+) -> Result<bool> {
+    if !state.config.dependency_fingerprint {
+        return Ok(true);
+    }
+    let matched = cache_entry_matches_dependency_fingerprint(
+        state,
+        sha,
+        scope,
+        data,
+        current_dependency_fingerprint,
+    )?;
+    let outcome = if matched {
+        "cache-hit"
+    } else {
+        "cache-guard-miss"
+    };
+    eprintln!("[BD-DBG][{outcome}] scope={scope} sha={sha} key={key}");
+    Ok(matched)
+}
+
+fn cache_entry_matches_dependency_fingerprint(
+    state: &Arc<State>,
+    sha: &str,
+    scope: &str,
+    data: &HashFileData,
+    current_dependency_fingerprint: &mut Option<String>,
+) -> Result<bool> {
+    let Some(cached_fingerprint) = data.dependency_fingerprint.as_deref() else {
+        eprintln!("[BD-DBG][cache-guard-no-fingerprint] scope={scope} sha={sha} policy=recompute");
+        return Ok(false);
+    };
+    if current_dependency_fingerprint.is_none() {
+        checkout(state, sha)?;
+        *current_dependency_fingerprint = match dependency_fingerprint_for_workspace(state) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                eprintln!("[Warn] {error:#}");
+                None
+            }
+        };
+    }
+    Ok(match current_dependency_fingerprint.as_deref() {
+        Some(current) => {
+            let matched = current == cached_fingerprint;
+            eprintln!(
+                "[BD-DBG][cache-guard-check] scope={scope} sha={sha} cachedFp={} currentFp={} matched={matched}",
+                short_fingerprint(cached_fingerprint),
+                short_fingerprint(current)
+            );
+            matched
+        }
+        None => {
+            eprintln!(
+                "[BD-DBG][cache-guard-check] scope={scope} sha={sha} cachedFp={} currentFp=NONE matched=false",
+                short_fingerprint(cached_fingerprint)
+            );
+            false
+        }
+    })
+}
+
+fn short_fingerprint(value: &str) -> &str {
+    &value[..value.len().min(12)]
+}
+
+fn dependency_fingerprint_for_workspace(state: &State) -> Result<String> {
+    state
+        .config
+        .hash_options
+        .bazel
+        .dependency_fingerprint()
+        .map_err(|error| {
+            anyhow!("failed to compute dependency fingerprint for cache guard: {error:#}")
+        })
 }
 
 fn configuration_fingerprint(config: &ServerConfig) -> String {
@@ -723,7 +1167,7 @@ fn resolve_sha(state: &State, revision: &str) -> Result<String> {
         ],
     )?;
     if !output.status.success() {
-        bail!("revision '{revision}' was not found");
+        bail!("revision '{revision}' is missing from the local clone");
     }
     let sha = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if sha.len() != 40 {
@@ -733,6 +1177,11 @@ fn resolve_sha(state: &State, revision: &str) -> Result<String> {
 }
 
 fn checkout(state: &State, sha: &str) -> Result<()> {
+    if let Ok(output) = git_output(state, &[String::from("rev-parse"), String::from("HEAD")]) {
+        if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == sha {
+            return Ok(());
+        }
+    }
     let args = [
         String::from("-c"),
         String::from("advice.detachedHead=false"),
@@ -753,6 +1202,10 @@ fn checkout(state: &State, sha: &str) -> Result<()> {
         bail!("git checkout failed for revision {sha}");
     }
     fs::remove_file(&index_lock).context("failed to remove stale .git/index.lock")?;
+    eprintln!(
+        "[Warn] cleared stale git index.lock in {}; retrying checkout of {sha}",
+        state.config.hash_options.bazel.workspace.display()
+    );
     git(state, &args)
 }
 
@@ -787,6 +1240,7 @@ fn metrics(state: &State) -> Value {
         "ready": state.ready.load(Ordering::Acquire),
         "gitEngine": "subprocess",
         "trackDeps": state.config.track_deps,
+        "dependencyFingerprint": state.config.dependency_fingerprint,
         "cache": {
             "directory": state.config.cache_dir.to_string_lossy(),
             "remote": state.config.remote_cache,
@@ -953,6 +1407,7 @@ mod tests {
             request_timeout: Duration::ZERO,
             cache_dir: PathBuf::from("."),
             track_deps: false,
+            dependency_fingerprint: false,
             no_initial_fetch: true,
             warmup_revisions: Vec::new(),
             cache_max_age: None,
@@ -965,6 +1420,11 @@ mod tests {
             s3_region: None,
             s3_endpoint: None,
             s3_force_path_style: false,
+            nexus_url: None,
+            nexus_repository: None,
+            nexus_prefix: String::new(),
+            nexus_credentials: None,
+            nexus_ca_cert: None,
         }
     }
 
@@ -1023,6 +1483,7 @@ mod tests {
         config.cache_dir = cache.to_path_buf();
         config.track_deps = track_deps;
         config.hash_options.track_deps = track_deps;
+        config.dependency_fingerprint = true;
         let fingerprint = configuration_fingerprint(&config);
         Arc::new(State {
             config,
@@ -1052,7 +1513,6 @@ mod tests {
     }
 
     struct CapturedS3Request {
-        method: String,
         url: String,
     }
 
@@ -1072,7 +1532,6 @@ mod tests {
                 let request = server.recv().unwrap();
                 sender
                     .send(CapturedS3Request {
-                        method: request.method().as_str().to_owned(),
                         url: request.url().to_owned(),
                     })
                     .unwrap();
@@ -1093,10 +1552,10 @@ mod tests {
         .unwrap()
         .with_path_style();
         (
-            RemoteCache {
+            RemoteCache::S3(S3Cache {
                 bucket,
                 prefix: normalize_s3_prefix(prefix),
-            },
+            }),
             receiver,
             handle,
         )
@@ -1161,7 +1620,10 @@ mod tests {
             "/team/repo/",
             vec![(200, b"hello".to_vec()), (200, Vec::new())],
         );
-        assert_eq!(remote.object_key("sha.fp"), "team/repo/sha.fp.json");
+        let RemoteCache::S3(s3) = &remote else {
+            panic!("expected the S3 backend");
+        };
+        assert_eq!(s3.object_key("sha.fp"), "team/repo/sha.fp.json");
         assert_eq!(remote.get("sha.fp"), Some(b"hello".to_vec()));
         remote.put("sha.fp", b"data");
         let captured = (0..2)
@@ -1171,16 +1633,6 @@ mod tests {
         assert!(captured
             .iter()
             .all(|request| request.url.contains("/bucket/team/repo/sha.fp.json")));
-        // A read is a single GET: a HeadObject probe in front of it would double the round trips
-        // and, worse, cannot report a miss -- S3 frames a HEAD 404 as chunked with no body, which
-        // the client surfaces as `attohttpc: Io Error: unexpected end of file`.
-        assert_eq!(
-            captured
-                .iter()
-                .map(|request| request.method.as_str())
-                .collect::<Vec<_>>(),
-            vec!["GET", "PUT"]
-        );
     }
 
     #[test]
@@ -1213,6 +1665,280 @@ mod tests {
             http_failure(&response),
             "Got HTTP 403 with content 'denied'"
         );
+    }
+
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIBkTCCATegAwIBAgIUaqMU9czNCvWG1R457FBnv8BzZfQwCgYIKoZIzj0EAwIw
+HTEbMBkGA1UEAwwSYmF6ZWwtZGlmZi10ZXN0LWNhMCAXDTI2MTAwNTE0NTUwOVoY
+DzIxMjYwOTExMTQ1NTA5WjAdMRswGQYDVQQDDBJiYXplbC1kaWZmLXRlc3QtY2Ew
+WTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASRkDRNQ1MfFy+8eM1z9tY6FseE+Bqs
+p3hQcwR/2L3wzZKwFWhaDmfn5WFKAINVfcGxOAKWKcXrhK+xWOz9KmYoo1MwUTAd
+BgNVHQ4EFgQUzsQ/MEApeEP6b/jW5ecBMceQbJcwHwYDVR0jBBgwFoAUzsQ/MEAp
+eEP6b/jW5ecBMceQbJcwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBF
+AiEAixF88BBeQUzoM0fYxa/ivGx5U4kHdLW82V9LIFiOV14CIG/00V8ZKfomL0v0
+nQBeQ4AIl47nDOrFeVnvse8R9IHJ
+-----END CERTIFICATE-----
+";
+
+    /// A canned Nexus reply: status, extra headers, body.
+    type NexusReply = (u16, Vec<(&'static str, &'static str)>, Vec<u8>);
+
+    struct CapturedNexusRequest {
+        method: Method,
+        url: String,
+        authorization: Option<String>,
+        content_type: Option<String>,
+        body: Vec<u8>,
+    }
+
+    fn nexus_cache_with_responses(
+        prefix: &str,
+        credentials: Option<NexusCredentials>,
+        responses: Vec<NexusReply>,
+    ) -> (
+        RemoteCache,
+        std_mpsc::Receiver<CapturedNexusRequest>,
+        thread::JoinHandle<()>,
+    ) {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/nexus", server.server_addr().to_ip().unwrap());
+        let (sender, receiver) = std_mpsc::channel();
+        let handle = thread::spawn(move || {
+            for (status, headers, body) in responses {
+                let mut request = server.recv().unwrap();
+                let header = |name: &'static str| {
+                    request
+                        .headers()
+                        .iter()
+                        .find(|header| header.field.equiv(name))
+                        .map(|header| header.value.as_str().to_owned())
+                };
+                let authorization = header("Authorization");
+                let content_type = header("Content-Type");
+                let mut received = Vec::new();
+                request.as_reader().read_to_end(&mut received).unwrap();
+                sender
+                    .send(CapturedNexusRequest {
+                        method: request.method().clone(),
+                        url: request.url().to_owned(),
+                        authorization,
+                        content_type,
+                        body: received,
+                    })
+                    .unwrap();
+                let mut response = Response::from_data(body).with_status_code(StatusCode(status));
+                for (name, value) in headers {
+                    response.add_header(Header::from_bytes(name, value).unwrap());
+                }
+                request.respond(response).unwrap();
+            }
+        });
+        let base = nexus_base_url(&endpoint, "bazel-diff", prefix).unwrap();
+        (
+            RemoteCache::Nexus(Box::new(NexusCache::new(base, credentials, None).unwrap())),
+            receiver,
+            handle,
+        )
+    }
+
+    #[test]
+    fn nexus_base_url_composes_repository_and_prefix() {
+        let url = |base: &str, repository: &str, prefix: &str| {
+            nexus_base_url(base, repository, prefix).map(|url| url.to_string())
+        };
+        assert_eq!(
+            url("https://nexus.example.com", "cache", "").unwrap(),
+            "https://nexus.example.com/repository/cache/"
+        );
+        assert_eq!(
+            url(
+                "https://nexus.example.com/nexus/?x=1#y",
+                "cache",
+                "/team//repo/"
+            )
+            .unwrap(),
+            "https://nexus.example.com/nexus/repository/cache/team/repo/"
+        );
+        assert_eq!(
+            url("http://host:8081", "cache", "a b").unwrap(),
+            "http://host:8081/repository/cache/a%20b/"
+        );
+        for (base, repository) in [
+            ("not a url", "cache"),
+            ("ftp://host", "cache"),
+            ("mailto:ops@example.com", "cache"),
+            ("https://user:pass@host", "cache"),
+            ("https://user@host", "cache"),
+            ("https://host", ""),
+            ("https://host", "a/b"),
+        ] {
+            assert!(url(base, repository, "").is_err(), "{base} {repository}");
+        }
+    }
+
+    #[test]
+    fn nexus_cache_is_selected_from_configuration() {
+        let mut config = test_config();
+        config.nexus_url = Some("https://nexus.example.com".to_owned());
+        config.nexus_repository = Some("cache".to_owned());
+        config.nexus_prefix = "team".to_owned();
+        let Some(RemoteCache::Nexus(cache)) = RemoteCache::new(&config).unwrap() else {
+            panic!("expected the Nexus backend");
+        };
+        assert_eq!(
+            cache.object_url("sha.fp").as_str(),
+            "https://nexus.example.com/repository/cache/team/sha.fp.json"
+        );
+        config.nexus_repository = Some("a/b".to_owned());
+        assert!(RemoteCache::new(&config).is_err());
+    }
+
+    #[test]
+    fn nexus_cache_reads_and_writes_with_basic_auth() {
+        let (remote, requests, handle) = nexus_cache_with_responses(
+            "/team/repo/",
+            Some(NexusCredentials {
+                username: "svc".to_owned(),
+                password: "s3cret".to_owned(),
+            }),
+            vec![
+                (200, Vec::new(), b"hello".to_vec()),
+                (404, Vec::new(), Vec::new()),
+                (201, Vec::new(), Vec::new()),
+            ],
+        );
+        assert_eq!(remote.get("sha.fp"), Some(b"hello".to_vec()));
+        assert_eq!(remote.get("missing"), None);
+        remote.put("sha.fp", b"data");
+        handle.join().unwrap();
+        let captured = requests.try_iter().collect::<Vec<_>>();
+        assert_eq!(captured.len(), 3);
+        let methods = captured
+            .iter()
+            .map(|r| r.method.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(methods, [Method::Get, Method::Get, Method::Put]);
+        assert_eq!(
+            captured[0].url,
+            "/nexus/repository/bazel-diff/team/repo/sha.fp.json"
+        );
+        assert_eq!(
+            captured[1].url,
+            "/nexus/repository/bazel-diff/team/repo/missing.json"
+        );
+        assert_eq!(captured[2].url, captured[0].url);
+        for request in &captured {
+            // base64("svc:s3cret")
+            assert_eq!(
+                request.authorization.as_deref(),
+                Some("Basic c3ZjOnMzY3JldA==")
+            );
+        }
+        assert_eq!(
+            captured[2].content_type.as_deref(),
+            Some("application/json")
+        );
+        assert_eq!(captured[2].body, b"data");
+    }
+
+    #[test]
+    fn nexus_cache_failures_degrade_without_following_redirects() {
+        let (remote, requests, handle) = nexus_cache_with_responses(
+            "",
+            None,
+            vec![
+                (500, Vec::new(), "x".repeat(1000).into_bytes()),
+                (401, Vec::new(), b"unauthorized".to_vec()),
+                (
+                    302,
+                    vec![("Location", "http://127.0.0.1:9/elsewhere")],
+                    Vec::new(),
+                ),
+                (
+                    400,
+                    Vec::new(),
+                    b"Repository does not allow updating assets".to_vec(),
+                ),
+            ],
+        );
+        assert_eq!(remote.get("failure"), None);
+        assert_eq!(remote.get("denied"), None);
+        assert_eq!(remote.get("moved"), None);
+        remote.put("immutable", b"data");
+        handle.join().unwrap();
+        let captured = requests.try_iter().collect::<Vec<_>>();
+        // Exactly one request per call: nothing is retried and the redirect is not followed.
+        assert_eq!(captured.len(), 4);
+        assert!(captured
+            .iter()
+            .all(|request| request.authorization.is_none()));
+    }
+
+    #[test]
+    fn nexus_cache_transport_errors_degrade_without_failing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let base = nexus_base_url(&endpoint, "cache", "").unwrap();
+        let remote = RemoteCache::Nexus(Box::new(NexusCache::new(base, None, None).unwrap()));
+        assert_eq!(remote.get("unreachable"), None);
+        remote.put("unreachable", b"data");
+    }
+
+    #[test]
+    fn nexus_http_failure_truncates_long_bodies() {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let address = server.server_addr().to_ip().unwrap();
+        let handle = thread::spawn(move || {
+            let request = server.recv().unwrap();
+            request
+                .respond(
+                    Response::from_data(format!("  {}  ", "é".repeat(300)))
+                        .with_status_code(StatusCode(503)),
+                )
+                .unwrap();
+        });
+        let response = attohttpc::get(format!("http://{address}/")).send().unwrap();
+        let failure = nexus_http_failure(response);
+        handle.join().unwrap();
+        assert_eq!(
+            failure,
+            format!("Got HTTP 503 with content '{}...'", "é".repeat(200))
+        );
+    }
+
+    #[test]
+    fn nexus_credentials_debug_redacts_password() {
+        let credentials = NexusCredentials {
+            username: "svc".to_owned(),
+            password: "s3cret".to_owned(),
+        };
+        let rendered = format!("{credentials:?}");
+        assert!(rendered.contains("svc"));
+        assert!(!rendered.contains("s3cret"));
+    }
+
+    #[test]
+    fn nexus_ca_certificates_load_from_pem_bundle() {
+        let directory = tempfile::tempdir().unwrap();
+        let bundle = directory.path().join("ca.pem");
+        fs::write(&bundle, format!("{TEST_CA_PEM}{TEST_CA_PEM}")).unwrap();
+        assert_eq!(read_pem_certificates(&bundle).unwrap().len(), 2);
+        let base = nexus_base_url("https://nexus.example.com", "cache", "").unwrap();
+        assert!(NexusCache::new(base.clone(), None, Some(&bundle)).is_ok());
+
+        let empty = directory.path().join("empty.pem");
+        fs::write(&empty, "not a certificate").unwrap();
+        assert!(read_pem_certificates(&empty).is_err());
+        let corrupt = directory.path().join("corrupt.pem");
+        fs::write(
+            &corrupt,
+            "-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        assert!(read_pem_certificates(&corrupt).is_err());
+        assert!(read_pem_certificates(&directory.path().join("missing.pem")).is_err());
+        assert!(NexusCache::new(base, None, Some(&empty)).is_err());
     }
 
     #[test]
@@ -1255,6 +1981,55 @@ mod tests {
     }
 
     #[test]
+    fn initial_fetch_failure_lame_ducks_instead_of_exiting() {
+        let (repo, _first, _second) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        // A remote nobody listens on: the startup fetch must fail, and the instance must stay
+        // un-ready (503 health, 503 queries, /metrics still served) rather than crash.
+        git_command(
+            repo.path(),
+            &["remote", "add", "origin", "git://127.0.0.1:1/nothing.git"],
+        );
+        let unready_state = |no_initial_fetch: bool| {
+            let mut config = test_config();
+            config.no_initial_fetch = no_initial_fetch;
+            config.hash_options.bazel.workspace = repo.path().to_path_buf();
+            config.git_path = PathBuf::from("git");
+            config.cache_dir = cache.path().to_path_buf();
+            let fingerprint = configuration_fingerprint(&config);
+            Arc::new(State {
+                config,
+                ready: AtomicBool::new(false),
+                workspace_lock: Mutex::new(()),
+                started: Instant::now(),
+                fingerprint,
+                remote: None,
+            })
+        };
+
+        let lame_duck = unready_state(false);
+        perform_initial_fetch(&lame_duck);
+        assert!(!lame_duck.ready.load(Ordering::Acquire));
+        assert!(
+            request(&lame_duck, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n")
+                .starts_with("HTTP/1.1 503")
+        );
+        assert!(request(
+            &lame_duck,
+            "GET /impacted_targets?from=a&to=b HTTP/1.1\r\nHost: x\r\n\r\n"
+        )
+        .starts_with("HTTP/1.1 503"));
+        let metrics = request(&lame_duck, "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(metrics.starts_with("HTTP/1.1 200"));
+        assert!(metrics.contains("\"ready\":false"));
+
+        // With the fetch skipped the same clone comes up ready.
+        let skipped = unready_state(true);
+        perform_initial_fetch(&skipped);
+        assert!(skipped.ready.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn git_resolution_checkout_and_errors_use_real_repository() {
         let (repo, first, second) = initialize_git_repo();
         let cache = tempfile::tempdir().unwrap();
@@ -1276,7 +2051,11 @@ mod tests {
             "two"
         );
         assert!(!repo.path().join(".git/index.lock").exists());
-        assert!(resolve_sha(&state, "missing").is_err());
+        let missing = resolve_sha(&state, "missing").unwrap_err().to_string();
+        assert_eq!(
+            missing,
+            "revision 'missing' is missing from the local clone"
+        );
         assert!(checkout(&state, "missing").is_err());
         assert!(git(&state, &["not-a-command".into()]).is_err());
 
@@ -1364,6 +2143,12 @@ mod tests {
         let (repo, _, sha) = initialize_git_repo();
         let cache = tempfile::tempdir().unwrap();
         let state = state_for_repo(repo.path(), cache.path(), true);
+        let dependency_fingerprint = state
+            .config
+            .hash_options
+            .bazel
+            .dependency_fingerprint()
+            .unwrap();
         let data = HashFileData {
             hashes: std::collections::BTreeMap::from([(
                 "//app:lib".into(),
@@ -1373,14 +2158,18 @@ mod tests {
                 "//app:lib".into(),
                 vec!["//dep:lib".into()],
             )]),
+            dependency_fingerprint: Some(dependency_fingerprint),
             ..Default::default()
         };
         let key = cache_key(&state, &sha, &BTreeSet::new());
         let path = cache.path().join(format!("{key}.json"));
         write_hashes(&path, &data, true);
         let before = fs::metadata(&path).unwrap().modified().unwrap();
-        let (loaded, hit) = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
-        assert!(hit);
+        let retrieval = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        assert!(retrieval.cache_hit);
+        assert!(retrieval.cache_read_millis.is_some());
+        assert!(retrieval.generation.is_none());
+        let loaded = retrieval.data;
         assert_eq!(loaded.hashes["//app:lib"].hash, "overall");
         assert_eq!(loaded.dep_edges["//app:lib"], ["//dep:lib"]);
         assert!(fs::metadata(path).unwrap().modified().unwrap() >= before);
@@ -1390,20 +2179,22 @@ mod tests {
     fn remote_cache_hit_is_backfilled_and_next_read_is_local() {
         let (repo, _, sha) = initialize_git_repo();
         let cache = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.hash_options.bazel.workspace = repo.path().to_path_buf();
+        config.git_path = PathBuf::from("git");
+        config.cache_dir = cache.path().to_path_buf();
+        config.dependency_fingerprint = true;
+        let dependency_fingerprint = config.hash_options.bazel.dependency_fingerprint().unwrap();
         let data = HashFileData {
             hashes: std::collections::BTreeMap::from([(
                 "//app:lib".into(),
                 hash("Rule", "overall", "direct"),
             )]),
+            dependency_fingerprint: Some(dependency_fingerprint),
             ..Default::default()
         };
         let bytes = serde_json::to_vec(&data.serialized(true, false)).unwrap();
-        // One GET serves the whole lookup; the second read is answered by the local backfill.
         let (remote, requests, handle) = remote_cache_with_responses("", vec![(200, bytes)]);
-        let mut config = test_config();
-        config.hash_options.bazel.workspace = repo.path().to_path_buf();
-        config.git_path = PathBuf::from("git");
-        config.cache_dir = cache.path().to_path_buf();
         let fingerprint = configuration_fingerprint(&config);
         let state = Arc::new(State {
             config,
@@ -1414,17 +2205,17 @@ mod tests {
             remote: Some(remote),
         });
 
-        let (first, first_hit) = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
-        assert!(first_hit);
-        assert_eq!(first.hashes["//app:lib"].hash, "overall");
+        let first = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        assert!(first.cache_hit);
+        assert!(first.cache_read_millis.is_some());
+        assert_eq!(first.data.hashes["//app:lib"].hash, "overall");
         let key = cache_key(&state, &sha, &BTreeSet::new());
         assert!(cache.path().join(format!("{key}.json")).is_file());
-        let (second, second_hit) = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
-        assert!(second_hit);
-        assert_eq!(second.hashes["//app:lib"].hash, "overall");
+        let second = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        assert!(second.cache_hit);
+        assert_eq!(second.data.hashes["//app:lib"].hash, "overall");
 
         requests.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(requests.recv_timeout(Duration::from_millis(200)).is_err());
         handle.join().unwrap();
     }
 
@@ -1433,11 +2224,18 @@ mod tests {
         let (repo, first, second) = initialize_git_repo();
         let cache = tempfile::tempdir().unwrap();
         let state = state_for_repo(repo.path(), cache.path(), true);
+        let dependency_fingerprint = state
+            .config
+            .hash_options
+            .bazel
+            .dependency_fingerprint()
+            .unwrap();
         let from = HashFileData {
             hashes: std::collections::BTreeMap::from([
                 ("//app:source".into(), hash("SourceFile", "old", "old")),
                 ("//app:rule".into(), hash("Rule", "old-rule", "same-direct")),
             ]),
+            dependency_fingerprint: Some(dependency_fingerprint.clone()),
             ..Default::default()
         };
         let to = HashFileData {
@@ -1449,6 +2247,7 @@ mod tests {
                 "//app:rule".into(),
                 vec!["//app:source".into()],
             )]),
+            dependency_fingerprint: Some(dependency_fingerprint),
             ..Default::default()
         };
         for (sha, data) in [(&first, &from), (&second, &to)] {
@@ -1469,7 +2268,14 @@ mod tests {
         let result = compute_query(&state, inputs, QueryKind::Distances).unwrap();
         assert_eq!(result["to"], second);
         assert_eq!(result["impactedTargets"].as_array().unwrap().len(), 2);
-        assert_eq!(result["profile"]["hashRetrievals"][0]["cacheHit"], true);
+        let retrievals = result["profile"]["hashRetrievals"].as_array().unwrap();
+        assert_eq!(retrievals.len(), 2);
+        for retrieval in retrievals {
+            assert_eq!(retrieval["cacheHit"], true);
+            assert!(retrieval["cacheReadMillis"].as_u64().is_some());
+            assert!(retrieval["durationMillis"].as_u64().is_some());
+            assert!(retrieval.get("generation").is_none());
+        }
         assert!(result.get("memoryProfile").is_some());
         assert_eq!(git_command(repo.path(), &["rev-parse", "HEAD"]), second);
     }
@@ -1507,6 +2313,138 @@ mod tests {
     }
 
     #[test]
+    fn cache_entries_without_dependency_fingerprint_are_rejected() {
+        let repo = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let state = state_for_repo(repo.path(), cache.path(), false);
+        let data = HashFileData {
+            hashes: std::collections::BTreeMap::from([(
+                "//app:lib".into(),
+                hash("Rule", "overall", "direct"),
+            )]),
+            ..Default::default()
+        };
+        let mut current_dependency_fingerprint = None;
+
+        assert!(!cache_entry_matches_dependency_fingerprint(
+            &state,
+            "abc",
+            "local",
+            &data,
+            &mut current_dependency_fingerprint,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn dependency_fingerprint_guard_is_off_unless_opted_in() {
+        let (repo, _, sha) = initialize_git_repo();
+        let cache = tempfile::tempdir().unwrap();
+        let mut state = state_for_repo(repo.path(), cache.path(), false);
+        Arc::get_mut(&mut state)
+            .unwrap()
+            .config
+            .dependency_fingerprint = false;
+        // Neither a missing fingerprint nor a stale one may block a hit when the guard is off.
+        for cached_fingerprint in [None, Some("stale".to_owned())] {
+            let data = HashFileData {
+                hashes: std::collections::BTreeMap::from([(
+                    "//app:lib".into(),
+                    hash("Rule", "overall", "direct"),
+                )]),
+                dependency_fingerprint: cached_fingerprint,
+                ..Default::default()
+            };
+            let key = cache_key(&state, &sha, &BTreeSet::new());
+            write_hashes(&cache.path().join(format!("{key}.json")), &data, false);
+            let retrieval = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+            assert!(retrieval.cache_hit);
+            assert_eq!(retrieval.data.hashes["//app:lib"].hash, "overall");
+        }
+
+        // The remote tier is trusted the same way: a fingerprint-less entry is a hit.
+        let remote_cache = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.hash_options.bazel.workspace = repo.path().to_path_buf();
+        config.git_path = PathBuf::from("git");
+        config.cache_dir = remote_cache.path().to_path_buf();
+        let data = HashFileData {
+            hashes: std::collections::BTreeMap::from([(
+                "//app:lib".into(),
+                hash("Rule", "overall", "direct"),
+            )]),
+            ..Default::default()
+        };
+        let bytes = serde_json::to_vec(&data.serialized(true, false)).unwrap();
+        let (remote, requests, handle) = remote_cache_with_responses("", vec![(200, bytes)]);
+        let fingerprint = configuration_fingerprint(&config);
+        let state = Arc::new(State {
+            config,
+            ready: AtomicBool::new(true),
+            workspace_lock: Mutex::new(()),
+            started: Instant::now(),
+            fingerprint,
+            remote: Some(remote),
+        });
+        let retrieval = get_hashes_locked(&state, &sha, &BTreeSet::new()).unwrap();
+        assert!(retrieval.cache_hit);
+        assert_eq!(retrieval.data.hashes["//app:lib"].hash, "overall");
+        requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        handle.join().unwrap();
+
+        // With the guard on, the same fingerprint-less entry is rejected, and since bazel is
+        // `/bin/false` here the recompute fails rather than silently serving stale hashes.
+        let mut guarded = state_for_repo(repo.path(), cache.path(), false);
+        Arc::get_mut(&mut guarded)
+            .unwrap()
+            .config
+            .dependency_fingerprint = true;
+        let data = HashFileData {
+            hashes: std::collections::BTreeMap::from([(
+                "//app:lib".into(),
+                hash("Rule", "overall", "direct"),
+            )]),
+            ..Default::default()
+        };
+        let key = cache_key(&guarded, &sha, &BTreeSet::new());
+        write_hashes(&cache.path().join(format!("{key}.json")), &data, false);
+        assert!(get_hashes_locked(&guarded, &sha, &BTreeSet::new()).is_err());
+    }
+
+    #[test]
+    fn miss_retrievals_serialize_the_generation_breakdown() {
+        let retrieval = Retrieval {
+            data: HashFileData::default(),
+            cache_hit: false,
+            cache_read_millis: None,
+            generation: Some(GenerationBreakdown {
+                checkout_millis: 1,
+                bazel_query_millis: 2,
+                target_hash_millis: 3,
+                module_graph_millis: 4,
+                cache_write_millis: 5,
+                target_count: 6,
+            }),
+        };
+        let value = retrieval_profile("abc", &retrieval, Instant::now());
+        assert_eq!(value["sha"], "abc");
+        assert_eq!(value["cacheHit"], false);
+        assert!(value["durationMillis"].as_u64().is_some());
+        assert!(value.get("cacheReadMillis").is_none());
+        assert_eq!(
+            value["generation"],
+            json!({
+                "checkoutMillis": 1,
+                "bazelQueryMillis": 2,
+                "targetHashMillis": 3,
+                "moduleGraphMillis": 4,
+                "cacheWriteMillis": 5,
+                "targetCount": 6
+            })
+        );
+    }
+
+    #[test]
     fn metrics_and_human_sizes_report_cache_state() {
         let repo = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
@@ -1515,6 +2453,7 @@ mod tests {
         let value = metrics(&state);
         assert_eq!(value["ready"], true);
         assert_eq!(value["trackDeps"], true);
+        assert_eq!(value["dependencyFingerprint"], true);
         assert_eq!(value["cache"]["entries"], 1);
         assert_eq!(value["cache"]["sizeHuman"], "1.5 KB");
         assert_eq!(human_bytes(0), "0 B");
@@ -1591,11 +2530,18 @@ mod tests {
         let (repo, first, second) = initialize_git_repo();
         let cache = tempfile::tempdir().unwrap();
         let state = state_for_repo(repo.path(), cache.path(), true);
+        let dependency_fingerprint = state
+            .config
+            .hash_options
+            .bazel
+            .dependency_fingerprint()
+            .unwrap();
         let from = HashFileData {
             hashes: std::collections::BTreeMap::from([
                 ("//app:source".into(), hash("SourceFile", "old", "old")),
                 ("//app:rule".into(), hash("Rule", "old-rule", "same-direct")),
             ]),
+            dependency_fingerprint: Some(dependency_fingerprint.clone()),
             ..Default::default()
         };
         let to = HashFileData {
@@ -1607,6 +2553,7 @@ mod tests {
                 "//app:rule".into(),
                 vec!["//app:source".into()],
             )]),
+            dependency_fingerprint: Some(dependency_fingerprint),
             ..Default::default()
         };
         for (sha, data) in [(&first, &from), (&second, &to)] {

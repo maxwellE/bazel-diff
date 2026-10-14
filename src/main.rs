@@ -1,18 +1,23 @@
 use anyhow::{bail, Context, Result};
 use bazel_diff::bazel::BazelOptions;
+use bazel_diff::explain::{self, ExplainFormat, ExplainLimits};
 use bazel_diff::fingerprint;
 use bazel_diff::hash::{generate_hashes, HashOptions};
 use bazel_diff::model::{
     filter_and_sort_labels, impacted_targets, impacted_targets_with_distances, HashFileData,
 };
 use bazel_diff::module_graph::impacted_with_module_changes;
-use clap::{ArgAction, Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+// Use mimalloc's per-thread heaps for parallel protobuf decoding in generate-hashes.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -41,12 +46,18 @@ enum Commands {
         about = "Compare two hash files and report impacted targets"
     )]
     GetImpactedTargets(GetImpactedTargetsArgs),
+    #[command(
+        about = "Explain why a target was impacted: the upstream target(s) whose own hash \
+                 changed, and the dependency path from each down to the queried target. \
+                 Renders as text, JSON, Graphviz DOT, or a Mermaid flowchart."
+    )]
+    Explain(ExplainArgs),
     #[command(about = "Warm Bazel and write snapshot hashes and fingerprint metadata")]
     Warmup(WarmupArgs),
     #[command(about = "Compute the snapshot/cache fingerprint for the current workspace")]
     Fingerprint(FingerprintArgs),
     #[command(about = "Run the HTTP impacted-target query service")]
-    Serve(ServeArgs),
+    Serve(Box<ServeArgs>),
 }
 
 #[derive(Clone, Debug, Args)]
@@ -221,6 +232,65 @@ struct GetImpactedTargetsArgs {
     exclude_external_targets: Option<bool>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ExplainFormatArg {
+    Text,
+    Json,
+    /// A Graphviz node-link graph of the blame subgraph, edges from root cause to queried target.
+    Dot,
+    /// A Mermaid `flowchart TD` of the same graph.
+    Mermaid,
+}
+
+impl From<ExplainFormatArg> for ExplainFormat {
+    fn from(value: ExplainFormatArg) -> Self {
+        match value {
+            ExplainFormatArg::Text => ExplainFormat::Text,
+            ExplainFormatArg::Json => ExplainFormat::Json,
+            ExplainFormatArg::Dot => ExplainFormat::Dot,
+            ExplainFormatArg::Mermaid => ExplainFormat::Mermaid,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct ExplainArgs {
+    /// The JSON file of target hashes for the initial revision, from `generate-hashes`.
+    #[arg(long = "startingHashes")]
+    starting_hashes: PathBuf,
+
+    /// The JSON file of target hashes for the final revision, from `generate-hashes`.
+    #[arg(long = "finalHashes")]
+    final_hashes: PathBuf,
+
+    /// The dependency-edges file written by `generate-hashes --depEdgesFile`. Required:
+    /// attribution is a walk over these edges.
+    #[arg(short = 'd', long = "depEdgesFile")]
+    dep_edges_file: PathBuf,
+
+    /// The impacted Bazel label to explain, e.g. '//service/a:app'.
+    #[arg(short = 't', long = "target")]
+    target: String,
+
+    /// Output format.
+    #[arg(short = 'f', long = "format", value_enum, ignore_case = true, default_value_t = ExplainFormatArg::Text)]
+    format: ExplainFormatArg,
+
+    /// Filepath to write the explanation to. Defaults to STDOUT.
+    #[arg(short = 'o', long = "output")]
+    output: Option<PathBuf>,
+
+    /// Report at most this many root causes, nearest first. The full count is always
+    /// reported alongside. 0 means no limit.
+    #[arg(long = "maxRootCauses", default_value_t = 25)]
+    max_root_causes: usize,
+
+    /// Stop searching this many dependency hops above the queried target. Root causes
+    /// further upstream are then not reported (a warning is printed). -1 means no bound.
+    #[arg(long = "maxDepth", default_value_t = -1, allow_hyphen_values = true)]
+    max_depth: i64,
+}
+
 #[derive(Debug, Args)]
 struct FingerprintArgs {
     #[command(flatten)]
@@ -282,6 +352,17 @@ struct ServeArgs {
     )]
     track_deps: bool,
 
+    /// Opt-in: only serve cached entries whose external-dependency fingerprint still matches
+    #[arg(
+        long = "dependencyFingerprint",
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value_t = false
+    )]
+    dependency_fingerprint: bool,
+
     #[arg(long = "no-initial-fetch")]
     no_initial_fetch: bool,
 
@@ -300,7 +381,7 @@ struct ServeArgs {
     #[arg(long = "cachePruneInterval", default_value = "1h")]
     cache_prune_interval: String,
 
-    #[arg(long = "s3Bucket")]
+    #[arg(long = "s3Bucket", conflicts_with = "nexus_url")]
     s3_bucket: Option<String>,
 
     #[arg(long = "s3Prefix", default_value = "")]
@@ -314,7 +395,29 @@ struct ServeArgs {
 
     #[arg(long = "s3ForcePathStyle")]
     s3_force_path_style: bool,
+
+    /// Base URL of a Sonatype Nexus Repository instance used as the shared cache tier
+    #[arg(long = "nexusUrl", requires = "nexus_repository")]
+    nexus_url: Option<String>,
+
+    /// Raw hosted repository on --nexusUrl that holds cache entries
+    #[arg(long = "nexusRepository", requires = "nexus_url")]
+    nexus_repository: Option<String>,
+
+    #[arg(long = "nexusPrefix", default_value = "")]
+    nexus_prefix: String,
+
+    /// Basic-auth user; the password is read from the BAZEL_DIFF_NEXUS_PASSWORD environment variable
+    #[arg(long = "nexusUsername", env = "BAZEL_DIFF_NEXUS_USERNAME")]
+    nexus_username: Option<String>,
+
+    /// PEM bundle of extra CA certificates to trust for --nexusUrl
+    #[arg(long = "nexusCaCert", value_parser = parse_normalized_path)]
+    nexus_ca_cert: Option<PathBuf>,
 }
+
+/// The Nexus password is environment-only so it never shows up in a process listing.
+const NEXUS_PASSWORD_ENV: &str = "BAZEL_DIFF_NEXUS_PASSWORD";
 
 fn flatten_options(values: &[String]) -> Vec<String> {
     values
@@ -351,7 +454,7 @@ fn normalize_path(path: PathBuf) -> PathBuf {
 /// `chdir("")` ENOENT that names the Bazel binary rather than the workspace;
 /// normalizing `../sibling` on its own pops nothing and silently yields
 /// `sibling`. Anchoring to the working directory gives both the directory the
-/// user meant, matching the Kotlin CLI. See
+/// user meant. See
 /// <https://github.com/Tinder/bazel-diff/issues/470>.
 fn parse_normalized_path(value: &str) -> Result<PathBuf, String> {
     let absolute = std::path::absolute(value)
@@ -626,6 +729,38 @@ fn run_get_impacted(args: &GetImpactedTargetsArgs, verbose: bool) -> Result<()> 
     Ok(())
 }
 
+fn run_explain(args: &ExplainArgs, verbose: bool) -> Result<()> {
+    let from = HashFileData::read(&args.starting_hashes)
+        .context("Incorrect starting hashes: file doesn't exist or can't be read.")?;
+    let to = HashFileData::read(&args.final_hashes)
+        .context("Incorrect final hashes: file doesn't exist or can't be read.")?;
+    let dep_edges: BTreeMap<String, Vec<String>> = serde_json::from_slice(
+        &fs::read(&args.dep_edges_file)
+            .context("Incorrect dep edges file: file doesn't exist or can't be read.")?,
+    )
+    .context("Incorrect dep edges file: expected a JSON object mapping labels to label arrays")?;
+    let limits = ExplainLimits {
+        max_depth: usize::try_from(args.max_depth).ok(),
+        max_roots: args.max_root_causes,
+    };
+    let outcome = explain::explain(&from.hashes, &to.hashes, &dep_edges, &args.target, limits)?;
+    for warning in &outcome.warnings {
+        eprintln!("[Warning] {warning}");
+    }
+    if verbose {
+        for note in &outcome.notes {
+            eprintln!("[Info] {note}");
+        }
+    }
+    let rendered = explain::render(&outcome.explanation, args.format.into());
+    match &args.output {
+        Some(path) => fs::write(path, rendered)
+            .with_context(|| format!("failed to write {}", path.display()))?,
+        None => print!("{rendered}"),
+    }
+    Ok(())
+}
+
 fn run_fingerprint(args: &FingerprintArgs) -> Result<()> {
     let flags = fingerprint_flags(&args.hashing, args.include_target_type, &args.target_type);
     let inputs = fingerprint::gather(
@@ -681,17 +816,42 @@ fn run_warmup_with(
 
 impl ServeArgs {
     fn to_config(&self, verbose: bool) -> Result<bazel_diff::server::ServerConfig> {
+        self.to_config_with_nexus_password(verbose, std::env::var(NEXUS_PASSWORD_ENV).ok())
+    }
+
+    fn to_config_with_nexus_password(
+        &self,
+        verbose: bool,
+        nexus_password: Option<String>,
+    ) -> Result<bazel_diff::server::ServerConfig> {
         if self.s3_bucket.is_some() && self.s3_endpoint.as_deref().is_some_and(str::is_empty) {
             bail!("--s3Endpoint must not be empty");
         }
-        let remote_cache = self.s3_bucket.as_ref().map(|bucket| {
-            let prefix = self.s3_prefix.trim_matches('/');
-            if prefix.is_empty() {
-                format!("s3://{bucket}/")
-            } else {
-                format!("s3://{bucket}/{prefix}/")
+        let nexus_credentials = match (&self.nexus_username, nexus_password) {
+            _ if self.nexus_url.is_none() => None,
+            (Some(username), Some(password)) => Some(bazel_diff::server::NexusCredentials {
+                username: username.clone(),
+                password,
+            }),
+            (None, None) => None,
+            (Some(_), None) => bail!("--nexusUsername requires {NEXUS_PASSWORD_ENV} to be set"),
+            (None, Some(_)) => bail!("{NEXUS_PASSWORD_ENV} requires --nexusUsername"),
+        };
+        let remote_cache = match (&self.s3_bucket, &self.nexus_url, &self.nexus_repository) {
+            (Some(bucket), _, _) => {
+                let prefix = self.s3_prefix.trim_matches('/');
+                Some(if prefix.is_empty() {
+                    format!("s3://{bucket}/")
+                } else {
+                    format!("s3://{bucket}/{prefix}/")
+                })
             }
-        });
+            (None, Some(url), Some(repository)) => Some(
+                bazel_diff::server::nexus_base_url(url, repository, &self.nexus_prefix)?
+                    .to_string(),
+            ),
+            _ => None,
+        };
         Ok(bazel_diff::server::ServerConfig {
             hash_options: hash_options(&self.hashing, None, None, self.track_deps, verbose)?,
             git_path: self.git_path.clone(),
@@ -699,6 +859,7 @@ impl ServeArgs {
             request_timeout: Duration::from_secs(self.request_timeout),
             cache_dir: self.cache_dir.clone(),
             track_deps: self.track_deps,
+            dependency_fingerprint: self.dependency_fingerprint,
             no_initial_fetch: self.no_initial_fetch,
             warmup_revisions: self.warmup_revisions.clone(),
             cache_max_age: self
@@ -719,6 +880,11 @@ impl ServeArgs {
             s3_region: self.s3_region.clone(),
             s3_endpoint: self.s3_endpoint.clone(),
             s3_force_path_style: self.s3_force_path_style,
+            nexus_url: self.nexus_url.clone(),
+            nexus_repository: self.nexus_repository.clone(),
+            nexus_prefix: self.nexus_prefix.clone(),
+            nexus_credentials,
+            nexus_ca_cert: self.nexus_ca_cert.clone(),
         })
     }
 }
@@ -740,6 +906,7 @@ fn normalize_argument(argument: String) -> String {
         "--no-excludeExternalTargets" => "--excludeExternalTargets=false".to_owned(),
         "--no-noBazelrc" => "--noBazelrc=false".to_owned(),
         "--no-trackDeps" => "--trackDeps=false".to_owned(),
+        "--no-dependencyFingerprint" => "--dependencyFingerprint=false".to_owned(),
         _ => argument,
     }
 }
@@ -758,6 +925,7 @@ fn run() -> Result<()> {
             run_generate(args, cli.verbose)?;
         }
         Commands::GetImpactedTargets(args) => run_get_impacted(args, cli.verbose)?,
+        Commands::Explain(args) => run_explain(args, cli.verbose)?,
         Commands::Fingerprint(args) => run_fingerprint(args)?,
         Commands::Warmup(args) => run_warmup(args, cli.verbose)?,
         Commands::Serve(args) => {
@@ -1096,6 +1264,7 @@ mod tests {
             "--cacheDir",
             "/tmp/cache",
             "--trackDeps",
+            "--dependencyFingerprint",
             "--requestTimeout",
             "30",
             "--cacheMaxAge",
@@ -1121,6 +1290,7 @@ mod tests {
         };
         let config = args.to_config(true).unwrap();
         assert!(config.track_deps);
+        assert!(config.dependency_fingerprint);
         assert_eq!(config.request_timeout, Duration::from_secs(30));
         assert_eq!(config.cache_max_age, Some(Duration::from_secs(7 * 86_400)));
         assert_eq!(config.cache_max_size, Some(10 * 1024u64.pow(3)));
@@ -1133,6 +1303,136 @@ mod tests {
         assert_eq!(config.warmup_revisions, ["main", "release"]);
         assert!(config.s3_force_path_style);
         assert!(config.hash_options.bazel.verbose);
+    }
+
+    #[test]
+    fn serve_config_parses_nexus_flags() {
+        let serve_args = |extra: &[&str]| {
+            let mut argv = vec![
+                "bazel-diff",
+                "serve",
+                "--workspacePath",
+                "/tmp/ws",
+                "--cacheDir",
+                "/tmp/cache",
+            ];
+            argv.extend_from_slice(extra);
+            let Commands::Serve(args) = parse(&argv).command else {
+                panic!("expected serve");
+            };
+            args
+        };
+        let nexus = [
+            "--nexusUrl",
+            "https://nexus.example.com/nexus/",
+            "--nexusRepository",
+            "bazel-diff",
+            "--nexusPrefix",
+            "/team/repo/",
+            "--nexusCaCert",
+            "/etc/ssl/../ssl/corp-ca.pem",
+        ];
+
+        let config = serve_args(&nexus)
+            .to_config_with_nexus_password(false, None)
+            .unwrap();
+        assert_eq!(
+            config.remote_cache.as_deref(),
+            Some("https://nexus.example.com/nexus/repository/bazel-diff/team/repo/")
+        );
+        assert_eq!(config.nexus_repository.as_deref(), Some("bazel-diff"));
+        assert_eq!(config.nexus_prefix, "/team/repo/");
+        assert_eq!(
+            config.nexus_ca_cert.as_deref(),
+            Some(Path::new("/etc/ssl/corp-ca.pem"))
+        );
+        assert!(config.nexus_credentials.is_none());
+        assert!(config.s3_bucket.is_none());
+
+        let mut authenticated = nexus.to_vec();
+        authenticated.extend(["--nexusUsername", "svc"]);
+        let config = serve_args(&authenticated)
+            .to_config_with_nexus_password(false, Some("s3cret".to_owned()))
+            .unwrap();
+        let credentials = config.nexus_credentials.unwrap();
+        assert_eq!(credentials.username, "svc");
+        assert_eq!(credentials.password, "s3cret");
+
+        // A username without a password, or a password without a username, is a misconfiguration.
+        assert!(serve_args(&authenticated)
+            .to_config_with_nexus_password(false, None)
+            .is_err());
+        assert!(serve_args(&nexus)
+            .to_config_with_nexus_password(false, Some("s3cret".to_owned()))
+            .is_err());
+        // The password environment variable is ignored when Nexus is not configured at all.
+        assert!(serve_args(&[])
+            .to_config_with_nexus_password(false, Some("s3cret".to_owned()))
+            .unwrap()
+            .remote_cache
+            .is_none());
+        // URL and repository problems surface at startup, not on the first cache lookup.
+        assert!(
+            serve_args(&["--nexusUrl", "ftp://host", "--nexusRepository", "cache"])
+                .to_config_with_nexus_password(false, None)
+                .is_err()
+        );
+        assert!(
+            serve_args(&["--nexusUrl", "https://host", "--nexusRepository", "a/b"])
+                .to_config_with_nexus_password(false, None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn serve_nexus_flags_require_each_other_and_conflict_with_s3() {
+        for extra in [
+            &["--nexusUrl", "https://host"][..],
+            &["--nexusRepository", "cache"][..],
+            &[
+                "--nexusUrl",
+                "https://host",
+                "--nexusRepository",
+                "cache",
+                "--s3Bucket",
+                "bucket",
+            ][..],
+        ] {
+            let mut argv = vec![
+                "bazel-diff",
+                "serve",
+                "--workspacePath",
+                "/tmp/ws",
+                "--cacheDir",
+                "/tmp/cache",
+            ];
+            argv.extend_from_slice(extra);
+            assert!(Cli::try_parse_from(&argv).is_err(), "{extra:?}");
+        }
+    }
+
+    #[test]
+    fn serve_dependency_fingerprint_guard_is_opt_in() {
+        let serve_config = |extra: &[&str]| {
+            let mut argv = vec![
+                "bazel-diff",
+                "serve",
+                "--workspacePath",
+                "/tmp/ws",
+                "--cacheDir",
+                "/tmp/cache",
+            ];
+            argv.extend_from_slice(extra);
+            let Commands::Serve(args) = parse(&argv).command else {
+                panic!("expected serve");
+            };
+            args.to_config(false).unwrap()
+        };
+        assert!(!serve_config(&[]).dependency_fingerprint);
+        assert!(serve_config(&["--dependencyFingerprint"]).dependency_fingerprint);
+        assert!(serve_config(&["--dependencyFingerprint=true"]).dependency_fingerprint);
+        assert!(!serve_config(&["--dependencyFingerprint=false"]).dependency_fingerprint);
+        assert!(!serve_config(&["--no-dependencyFingerprint"]).dependency_fingerprint);
     }
 
     #[test]
@@ -1329,6 +1629,121 @@ mod tests {
         assert_eq!(values[0].target_distance, 0);
         assert_eq!(values[1].label, "//app:top");
         assert_eq!(values[1].target_distance, 1);
+    }
+
+    fn explain_fixture(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        // //common:util.py -> //common:lib -> //service/a:app
+        let from = dir.join("from.json");
+        let to = dir.join("to.json");
+        let deps = dir.join("deps.json");
+        fs::write(
+            &from,
+            r#"{"//service/a:app": "Rule#app~app-direct", "//common:lib": "Rule#lib~lib-direct", "//common:util.py": "SourceFile#util~util"}"#,
+        )
+        .unwrap();
+        fs::write(
+            &to,
+            r#"{"//service/a:app": "Rule#app2~app-direct", "//common:lib": "Rule#lib2~lib-direct", "//common:util.py": "SourceFile#util2~util2"}"#,
+        )
+        .unwrap();
+        fs::write(
+            &deps,
+            r#"{"//service/a:app": ["//common:lib"], "//common:lib": ["//common:util.py"]}"#,
+        )
+        .unwrap();
+        (from, to, deps)
+    }
+
+    fn explain_args(dir: &Path, extra: &[&str]) -> ExplainArgs {
+        let (from, to, deps) = explain_fixture(dir);
+        let mut arguments = vec![
+            "bazel-diff".to_owned(),
+            "explain".to_owned(),
+            "-sh".to_owned(),
+            from.display().to_string(),
+            "-fh".to_owned(),
+            to.display().to_string(),
+            "-d".to_owned(),
+            deps.display().to_string(),
+            "-t".to_owned(),
+            "//service/a:app".to_owned(),
+        ];
+        arguments.extend(extra.iter().map(|argument| (*argument).to_owned()));
+        let cli = Cli::try_parse_from(arguments.into_iter().map(normalize_argument)).unwrap();
+        let Commands::Explain(args) = cli.command else {
+            panic!("expected explain");
+        };
+        args
+    }
+
+    #[test]
+    fn explain_defaults_and_writes_the_chosen_format_to_the_output_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("explain.txt");
+
+        let args = explain_args(dir.path(), &[]);
+        assert_eq!(args.max_root_causes, 25);
+        assert_eq!(args.max_depth, -1);
+        assert_eq!(args.format, ExplainFormatArg::Text);
+
+        let mut text = explain_args(dir.path(), &[]);
+        text.output = Some(output.clone());
+        run_explain(&text, false).unwrap();
+        let rendered = fs::read_to_string(&output).unwrap();
+        assert!(rendered.contains("IMPACTED (indirectly"));
+        assert!(rendered.contains("//common:util.py -> //common:lib -> //service/a:app"));
+
+        let mut dot = explain_args(dir.path(), &["--format", "DOT"]);
+        dot.output = Some(output.clone());
+        run_explain(&dot, false).unwrap();
+        let rendered = fs::read_to_string(&output).unwrap();
+        assert!(rendered.contains("digraph bazel_diff_impact {"));
+        assert!(rendered.contains("(root cause)"));
+
+        let mut mermaid = explain_args(dir.path(), &["-f", "mermaid"]);
+        mermaid.output = Some(output.clone());
+        run_explain(&mermaid, false).unwrap();
+        assert!(fs::read_to_string(&output)
+            .unwrap()
+            .contains("classDef rootCause"));
+
+        let mut json = explain_args(dir.path(), &["--format", "json"]);
+        json.output = Some(output.clone());
+        run_explain(&json, true).unwrap();
+        let rendered = fs::read_to_string(&output).unwrap();
+        assert!(rendered.contains("\"rootCauses\""));
+        assert!(rendered.contains("\"packageHops\""));
+
+        // util.py is 2 hops up; a 1-hop budget cannot reach it.
+        let mut shallow = explain_args(dir.path(), &["--maxDepth", "1"]);
+        shallow.output = Some(output.clone());
+        run_explain(&shallow, false).unwrap();
+        assert!(fs::read_to_string(&output)
+            .unwrap()
+            .contains("No root cause could be attributed"));
+    }
+
+    #[test]
+    fn explain_reports_usage_errors_for_bad_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut typo = explain_args(dir.path(), &[]);
+        typo.target = "//typo:nope".to_owned();
+        let error = run_explain(&typo, false).unwrap_err().to_string();
+        assert!(
+            error.contains("is not present in either hash file"),
+            "{error}"
+        );
+
+        let mut missing_hashes = explain_args(dir.path(), &[]);
+        missing_hashes.starting_hashes = dir.path().join("missing.json");
+        let error = format!("{:#}", run_explain(&missing_hashes, false).unwrap_err());
+        assert!(error.contains("Incorrect starting hashes"), "{error}");
+
+        let mut missing_deps = explain_args(dir.path(), &[]);
+        missing_deps.dep_edges_file = dir.path().join("missing-deps.json");
+        let error = format!("{:#}", run_explain(&missing_deps, false).unwrap_err());
+        assert!(error.contains("Incorrect dep edges file"), "{error}");
     }
 
     #[test]

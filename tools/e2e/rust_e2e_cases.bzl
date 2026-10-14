@@ -52,6 +52,10 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "example::example_script_reports_impacted_targets",
+                "timeout": "moderate",
+            },
+            {
                 "name": "external::bzlmod_cc_transitive_deps_query",
                 "timeout": "moderate",
             },
@@ -129,6 +133,14 @@ RUST_E2E_SUITES = [
             },
             {
                 "name": "regressions::hashes_are_hermetic_across_workspace_paths",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::hidden_wrapper_external_repo_change_propagates_with_explicit_chain",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::hidden_wrapper_external_repo_change_reaches_main_consumer",
                 "timeout": "moderate",
             },
             {

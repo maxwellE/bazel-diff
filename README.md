@@ -7,7 +7,7 @@
 
 `bazel-diff` offers several key advantages over rolling your own target diffing solution
 
-1. `bazel-diff` is designed for very large Bazel projects. We use Java Protobuf's `parseDelimitedFrom` method alongside Bazel Query's `streamed_proto` output option. These two together allow you to parse Gigabyte or larger protobuf messages. We have tested it with projects containing tens of thousands of targets.
+1. `bazel-diff` is designed for very large Bazel projects. We stream Bazel Query's `streamed_proto` output message by message instead of loading it whole, which allows you to parse Gigabyte or larger protobuf outputs. We have tested it with projects containing hundreds of thousands of targets.
 2. We avoid usage of large command line query lists when interacting with Bazel, [issue here](https://github.com/bazelbuild/bazel/issues/8609). When you interact with Bazel with thousands of query parameters you can reach an upper maximum limit, seeing this error `bash: /usr/local/bin/bazel: Argument list too long`. `bazel-diff` is smart enough to avoid these errors.
 3. `bazel-diff` has been tested with file renames, deletions, and modifications. Works on `bzl` files, `WORKSPACE` files, `BUILD` files and regular files
 
@@ -25,8 +25,9 @@ This approach was inspired by the [following BazelConf talk](https://www.youtube
 ## Prerequisites
 
 * Git
-* Bazel 3.3.0 or higher
-* Java 8 JDK or higher (Bazel requires this)
+* Bazel 8 or higher (use the latest release for your major version)
+
+Bazel needs a JDK; the `bazel-diff` binary does not.
 
 ## Getting Started
 
@@ -107,7 +108,94 @@ This will produce an impacted targets json list with target label, target distan
 ]
 ```
 
-## Query Service (experimental)
+## Explaining Why a Target Was Impacted
+
+`get-impacted-targets` tells you *that* `//service/a:app` needs rebuilding. It does not tell you
+*why* — and a service can be impacted for several reasons at once: it changed itself, a shared
+module it depends on changed, or both. `explain` answers that question by attributing the target's
+hash change to the upstream target(s) actually responsible, and by showing the dependency path the
+change travelled along. See [issue #479](https://github.com/Tinder/bazel-diff/issues/479).
+
+It reads the same three files `get-impacted-targets` consumes — it runs no `bazel query` and needs
+no workspace — so it is cheap to run after the fact on a CI machine that only kept the artifacts:
+
+```bash
+bazel-diff generate-hashes -w /path/to/workspace -b bazel --depEdgesFile deps.json final_hashes.json
+
+bazel-diff explain \
+  -sh starting_hashes.json \
+  -fh final_hashes.json \
+  -d deps.json \
+  --target //service/a:app
+```
+
+```text
+//service/a:app  [Rule]
+IMPACTED (directly -- this target changed on its own)
+
+Root causes: 3
+
+  1. //service/a:app  [Rule]
+     the rule's own definition or attributes changed
+     0 hops -- this is the queried target itself
+     //service/a:app
+
+  2. //service/a:main.py  [SourceFile]
+     source file content changed
+     1 hop (0 package boundaries crossed)
+     //service/a:main.py -> //service/a:app
+
+  3. //common/data:util.py  [SourceFile]
+     source file content changed
+     3 hops (2 package boundaries crossed)
+     //common/data:util.py -> //common:gen_srcs -> //common:lib -> //service/a:app
+```
+
+A **root cause** is a target whose *own* hash changed — its `directHash` moved, or it is new in the
+final revision. Everything between a root cause and the queried target merely carried the change
+downstream. This is the same DIRECT/INDIRECT classification that backs the distance metrics above,
+so `explain` and `--depEdgesFile` always agree on which targets are roots.
+
+`--depEdgesFile` is required: attribution is a walk over those edges. Generate it with
+`generate-hashes --depEdgesFile` (or, on the query service, fetch it from `GET /dependency_edges`).
+
+### Visualizing the blame graph
+
+`--format dot` and `--format mermaid` emit the blame subgraph — the queried target, the root causes,
+and the targets that carried the change between them. Only that subgraph is rendered, never the
+whole impacted set, which is what keeps the output readable on a monorepo.
+
+```bash
+bazel-diff explain -sh starting_hashes.json -fh final_hashes.json -d deps.json \
+  --target //service/a:app --format dot -o why.dot
+dot -Tsvg why.dot -o why.svg
+```
+
+Edges point in **impact-propagation** direction — root cause at the top, queried target at the
+bottom — so reading downward follows the change as it flows in. (This is the reverse of the
+`--depEdgesFile` orientation, which maps a label to the deps it consumes.)
+
+`--format mermaid` emits a `flowchart TD` that renders inline in a GitHub comment or PR description,
+which is handy for posting "here is why your PR rebuilt these targets" from CI. Each role has its
+own border color *and* node shape *and* an explicit role label, so the graph stays readable in
+monochrome and for viewers who cannot separate the two hues.
+
+`--format json` gives the same data structurally (root causes, paths, nodes, edges) for feeding
+another tool.
+
+### Bounding the output
+
+A target deep in a monorepo can have a great many root causes. Two knobs bound the work, and
+neither ever truncates silently — the full count is always reported:
+
+* `--maxRootCauses` (default `25`) reports only the nearest N root causes. `0` means all of them.
+* `--maxDepth` (default `-1`, unbounded) stops the search N dependency hops above the queried
+  target. When a bound cuts the search short, a warning says so.
+
+## Query Service
+
+`bazel-diff serve` is production ready — it has been validated internally in production CI and is
+supported for production use.
 
 Instead of running `generate-hashes` from scratch on every CI invocation, you can run `bazel-diff` as
 a long-running HTTP service that answers affectedness queries between two git revisions and caches
@@ -158,8 +246,8 @@ curl 'http://localhost:8080/impacted_targets?from=main&to=my-feature-branch'
   as unchanged, turning an O(all source files) content read into O(changed files) — the same
   optimization as `generate-hashes --modified-filepaths`. The list must be a **superset** of what
   actually changed: a truly-changed file left off it is content-skipped on both sides and its
-  impacted targets are missed (hence experimental). Omit it (or send `[]`) for the full-content hash,
-  identical to the GET form. `POST /impacted_targets_with_distances` accepts the same body.
+  impacted targets are missed, so treat the list as a correctness contract. Omit it (or send `[]`)
+  for the full-content hash, identical to the GET form. `POST /impacted_targets_with_distances` accepts the same body.
 
 ```bash
 curl -X POST http://localhost:8080/impacted_targets \
@@ -259,7 +347,48 @@ revision are also harmless — entries are deterministic per key, so last-write-
 content. The `--cacheMax*` pruning flags bound the *local* tier only; bound the bucket with an S3
 lifecycle policy instead.
 
-Notes and current limitations:
+### Shared Sonatype Nexus cache
+
+If your organization already runs [Sonatype Nexus Repository](https://www.sonatype.com/products/sonatype-nexus-repository),
+a *raw (hosted)* repository can serve as the shared tier instead of S3. It behaves exactly like
+the S3 tier above — local disk first, Nexus on a local miss (backfilling disk on a hit), every
+generated entry published to both, and every Nexus failure degraded to a miss or a local-only
+write — and the two are mutually exclusive.
+
+```bash
+export BAZEL_DIFF_NEXUS_PASSWORD=...   # password, or a Nexus user token's pass code
+bazel-diff serve \
+  --workspacePath /path/to/workspace-clone \
+  --cacheDir /var/cache/bazel-diff \
+  --nexusUrl https://nexus.example.com \
+  --nexusRepository bazel-diff-cache \
+  --nexusPrefix my-repo \
+  --nexusUsername bazel-diff-svc
+```
+
+Entries live at `<nexusUrl>/repository/<nexusRepository>/<nexusPrefix>/<key>.json` and are read
+and written with plain `GET`/`PUT` against Nexus's raw content API. Include any context path Nexus
+is served under in `--nexusUrl` (e.g. `https://example.com/nexus`).
+
+* **Repository setup.** Create a *raw (hosted)* repository and set its *Deployment policy* to
+  **Allow redeploy**: replicas that race on the same revision each publish (identical) content,
+  and Nexus answers a redeploy under "Disable redeploy" with `400`, which is logged as a failed
+  write. A raw *group* or *proxy* repository cannot accept writes.
+* **Credentials.** `--nexusUsername` (or `BAZEL_DIFF_NEXUS_USERNAME`) and the
+  `BAZEL_DIFF_NEXUS_PASSWORD` environment variable are sent as HTTP basic auth; set both, or
+  neither for a repository that allows anonymous access. The password is deliberately
+  environment-only so it never appears in a process listing, and credentials embedded in
+  `--nexusUrl` are rejected. A Nexus [user token](https://help.sonatype.com/en/user-tokens.html)
+  works too: pass its name code as the username and pass code as the password. The account needs
+  `nx-repository-view-raw-<repository>-read`, `-add` and `-edit` privileges.
+* **TLS.** Public CAs are trusted out of the box. For a Nexus behind an internal CA, point
+  `--nexusCaCert` at a PEM bundle of the extra roots to trust.
+* **Redirects are not followed**, so basic-auth credentials are never replayed to another host;
+  point `--nexusUrl` at the final `https://` address rather than one that redirects to it.
+* **Retention.** As with S3, `--cacheMax*` bounds the local tier only. Bound the repository with a
+  Nexus *cleanup policy* (e.g. by component age or last-downloaded date) attached to it.
+
+Notes and operational guidance:
 
 * Distance metrics (`/impacted_targets_with_distances`) and the generate-hashes graph
   (`/dependency_edges`) require the dependency-edge graph, which is
@@ -267,6 +396,17 @@ Notes and current limitations:
   entry, so it is opt-in. The flag is folded into the cache key, so enabling or disabling it never
   reuses a previously cached entry of the other kind. This mirrors the `generate-hashes --depEdgesFile`
   / `get-impacted-targets --depEdgesFile` flow used by the CLI.
+
+* Dependency fingerprinting (`--dependencyFingerprint`) is opt-in. When enabled, every generated
+  cache entry records a fingerprint of the workspace's external-dependency state (the bzlmod module
+  graph and the resolved repository definitions, via `bazel mod`), and a cached entry -- local or
+  shared tier -- is only served when that fingerprint still matches the checked-out revision; entries
+  without a fingerprint, or with a stale one, are regenerated. This catches hashes that went stale
+  because an external repository changed underneath an unchanged commit, at the cost of a checkout
+  and a `bazel mod` round trip on every cache lookup. It is off by default, in which case a cache
+  entry is trusted on its key alone and the fingerprint is neither computed nor stored. The flag is
+  not part of the cache key: a guarded server rewrites unguarded entries with a fingerprint as it
+  regenerates them, and an unguarded server serves guarded entries as-is.
 
 * The service checks out revisions inside `--workspacePath`, so point it at a dedicated clone, not a
   working tree you edit. All workspace-mutating work (git checkout + `bazel query`) is serialized,
@@ -284,7 +424,8 @@ Notes and current limitations:
   evicting least-recently-used entries first — a cache hit refreshes an entry's recency, so revisions
   under active query are not expired out from under live traffic. With no `--cacheMax*` flag set the
   cache is never pruned (the previous behavior). The `--cacheMax*` flags always bound the local-disk
-  tier only; the shared S3 tier (see above) manages its own retention via a bucket lifecycle policy.
+  tier only; the shared S3 or Nexus tier (see above) manages its own retention via a bucket
+  lifecycle policy or a Nexus cleanup policy.
 * Query-affecting flags (`--useCquery`, `--fineGrainedHashExternalRepos`, etc.) mirror
   `generate-hashes`, and are folded into the cache key so a server started with different flags never
   serves another configuration's cached hashes.
@@ -296,7 +437,7 @@ Notes and current limitations:
   such hash is cheaper because it skips reading unchanged files. The extra entries are bounded by the
   same LRU `--cacheMax*` pruning as everything else.
 * Containerization and multi-instance deployment manifests are not yet included; the shared S3
-  cache tier above is the building block for running replicas behind a load balancer.
+  or Nexus cache tier above is the building block for running replicas behind a load balancer.
 
 <!-- BEGIN_SECTION: cli-help -->
 ## CLI Interface
@@ -304,412 +445,262 @@ Notes and current limitations:
 `bazel-diff` Command
 
 ```terminal
-Usage: bazel-diff [-hvV] [COMMAND]
-Writes to a file the impacted targets between two Bazel graph JSON files
-  -h, --help      Show this help message and exit.
-  -v, --verbose   Display query string, missing files and elapsed time
-  -V, --version   Print version information and exit.
+Writes impacted targets between two Bazel graph hash files
+
+Usage: bazel-diff [OPTIONS] <COMMAND>
+
 Commands:
-  generate-hashes       Writes to a file the SHA256 hashes for each Bazel
-                          Target in the provided workspace.
-  get-impacted-targets  Command-line utility to analyze the state of the bazel
-                          build graph
-  warmup                Record-side entrypoint for Firecracker snapshots: runs
-                          generate-hashes for the base revision, writes base
-                          hashes + fingerprint to known paths, and exits 0 only
-                          once the Bazel server is warm (the host's 'safe to
-                          snapshot' signal).
-  fingerprint           Computes the snapshot cache key over the inputs that
-                          affect the build graph (bazel version, MODULE.bazel.
-                          lock, .bazelrc, bazel-diff version, flag set) and
-                          writes it as JSON. Used to decide whether a
-                          Firecracker snapshot is safe to consume.
-  serve                 Runs bazel-diff as a long-running HTTP query service
-                          that returns the impacted targets between two git
-                          revisions, caching generated hashes per commit SHA.
+  generate-hashes       Write canonical hashes for Bazel targets in a workspace
+  get-impacted-targets  Compare two hash files and report impacted targets
+  explain               Explain why a target was impacted: the upstream target(s) whose own hash changed, and the dependency path from each down to the queried target. Renders as text, JSON, Graphviz DOT, or a Mermaid flowchart.
+  warmup                Warm Bazel and write snapshot hashes and fingerprint metadata
+  fingerprint           Compute the snapshot/cache fingerprint for the current workspace
+  serve                 Run the HTTP impacted-target query service
+  help                  Print this message or the help of the given subcommand(s)
+
+Options:
+  -v, --verbose  
+  -h, --help     Print help
+  -V, --version  Print version
 ```
 
 ### `generate-hashes` command
 
 ```terminal
-Usage: bazel-diff generate-hashes [-hkvV] [--[no-]excludeExternalTargets] [--
-                                  [no-]includeTargetType] [--[no-]useCquery]
-                                  [-b=<bazelPath>]
-                                  [--contentHashPath=<contentHashPath>]
-                                  [--cqueryExpression=<cqueryExpression>]
-                                  [-d=<depsMappingJSONPath>]
-                                  [--excludeTargetsQuery=<excludeTargetsQuery>]
-                                  [--fineGrainedHashExternalReposFile=<fineGrain
-                                  edHashExternalReposFile>]
-                                  [-m=<modifiedFilepaths>] [-s=<seedFilepaths>]
-                                  -w=<workspacePath>
-                                  [--alwaysAffectedTags=<alwaysAffectedTags>]...
-                                   [-co=<bazelCommandOptions>]...
-                                  [--cqueryCommandOptions=<cqueryCommandOptions>
-                                  ]...
-                                  [--fineGrainedHashExternalRepos=<fineGrainedHa
-                                  shExternalRepos>]...
-                                  [--ignoredRuleHashingAttributes=<ignoredRuleHa
-                                  shingAttributes>]...
-                                  [-so=<bazelStartupOptions>]...
-                                  [-tt=<targetType>[,<targetType>...]]...
-                                  <outputPath>
-Writes to a file the SHA256 hashes for each Bazel Target in the provided
-workspace.
-      <outputPath>        The filepath to write the resulting JSON of
-                            dictionary target => SHA-256 values. If not
-                            specified, the JSON will be written to STDOUT.
-      --alwaysAffectedTags=<alwaysAffectedTags>
-                          Comma separated list of Bazel target tags (e.g.
-                            `external`). Any target whose `tags` attribute
-                            contains one of these values is always reported as
-                            impacted: a per-invocation sentinel is mixed into
-                            its hash so a diff of two `generate-hashes` runs
-                            always marks it changed. Use this for non-hermetic
-                            targets that read undeclared workspace state at
-                            execution time (e.g. repo-scanning linters such as
-                            buildifier/gofmt/eslint tests) which would
-                            otherwise hash as unchanged and be wrongly skipped
-                            by target determination. This is the Bazel target
-                            `external` *tag* and is unrelated to
-                            --excludeExternalTargets /
-                            --fineGrainedHashExternalRepos, which concern
-                            external *repositories*.
-  -b, --bazelPath=<bazelPath>
-                          Path to Bazel binary. If not specified, the Bazel
-                            binary available in PATH will be used.
-      -co, --bazelCommandOptions=<bazelCommandOptions>
-                          Additional space separated Bazel command options used
-                            when invoking `bazel query`
-      --contentHashPath=<contentHashPath>
-                          Path to content hash json file. It's a map which maps
-                            a workspace-relative file path (and
-                            `external/<repoName>/<path>` for fine-grained
-                            external repo files) to its content hash. Files in
-                            this map will skip content hashing and use provided
-                            value
-      --cqueryCommandOptions=<cqueryCommandOptions>
-                          Additional space separated Bazel command options used
-                            when invoking `bazel cquery`. This flag is has no
-                            effect if `--useCquery`is false.
-      --cqueryExpression=<cqueryExpression>
-                          Custom cquery expression to use instead of the
-                            default 'deps(//...:all-targets)'. This allows you
-                            to exclude problematic targets (e.g., analysis_test
-                            targets that are designed to fail). Example: 'deps
-                            (//...:all-targets) except //path/to/failing:
-                            target'. This flag has no effect if `--useCquery`
-                            is false.
-  -d, --depEdgesFile=<depsMappingJSONPath>
-                          Path to the file where dependency edges are written
-                            to. If not specified, the dependency edges will not
-                            be written to a file. Needed for computing build
-                            graph distance metrics. See bazel-diff docs for
-                            more details about build graph distance metrics.
-      --[no-]excludeExternalTargets
-                          If true, exclude external targets (do not query
-                            //external:all-targets). When Bzlmod is enabled
-                            (detected via bazel mod graph), external targets
-                            are excluded automatically. Set this when using
-                            Bazel with --enable_workspace=false in other
-                            configurations. Defaults to false.
-      --excludeTargetsQuery=<excludeTargetsQuery>
-                          A Bazel query expression whose matched targets are
-                            excluded from the generated hashes via the `except`
-                            operator. Applied to the main target universe for
-                            both `query` and `cquery`. Use this to drop targets
-                            you never want reported as impacted, e.g.
-                            `manual`-tagged targets: --excludeTargetsQuery='attr
-                            ("tags", "[\[ ]manual[,\]]", //...)'. Excluded
-                            targets are absent from hashing, so a kept target
-                            that depended on one no longer tracks changes to it.
-      --fineGrainedHashExternalRepos=<fineGrainedHashExternalRepos>
-                          Comma separate list of external repos in which
-                            fine-grained hashes are computed for the targets.
-                            By default, external repos are treated as an opaque
-                            blob. If an external repo is specified here,
-                            bazel-diff instead computes the hash for individual
-                            targets. For example, one wants to specify `maven`
-                            here if they user rules_jvm_external so that
-                            individual third party dependency change won't
-                            invalidate all targets in the mono repo.
-      --fineGrainedHashExternalReposFile=<fineGrainedHashExternalReposFile>
-                          A text file containing a newline separated list of
-                            external repos. Similar to
-                            --fineGrainedHashExternalRepos but helps you avoid
-                            exceeding max arg length. Mutually exclusive with
-                            --fineGrainedHashExternalRepos.
-  -h, --help              Show this help message and exit.
-      --ignoredRuleHashingAttributes=<ignoredRuleHashingAttributes>
-                          Attributes that should be ignored when hashing rule
-                            targets.
-      --[no-]includeTargetType
-                          Whether include target type in the generated JSON or
-                            not.
-                          If false, the generate JSON schema is: {"<target>":
-                            "<sha256>"}
-                          If true, the generate JSON schema is: {"<target>":
-                            "<type>#<sha256>" }
-  -k, --[no-]keep_going   This flag controls if `bazel query` will be executed
-                            with the `--keep_going` flag or not. Enabling this
-                            flag lets `bazel query` tolerate failures in your
-                            Bazel graph, but may silently drop targets that
-                            fail to resolve and produce non-deterministic
-                            hashes. Disabling it catches configuration issues
-                            by failing loudly. Defaults to `false`
-  -m, --modified-filepaths=<modifiedFilepaths>
-                          Experimental: A text file containing a newline
-                            separated list of filepaths (relative to the
-                            workspace) these filepaths should represent the
-                            modified files between the specified revisions and
-                            will be used to scope what files are hashed during
-                            hash generation.
-  -s, --seed-filepaths=<seedFilepaths>
-                          A text file containing a newline separated list of
-                            filepaths. Each file in this list will be read and
-                            its content will be used as a SHA256 seed when
-                            determining affected targets in the build graph.
-                            Invalidating any of these files will effectively
-                            mark all targets as affected.
-      -so, --bazelStartupOptions=<bazelStartupOptions>
-                          Additional space separated Bazel client startup
-                            options used when invoking Bazel
-      -tt, --targetType=<targetType>[,<targetType>...]
-                          The types of targets to filter. Use comma (,) to
-                            separate multiple values, e.g.
-                            '--targetType=SourceFile,Rule,GeneratedFile'.
-      --[no-]useCquery    If true, use cquery instead of query when generating
-                            dependency graphs. Using cquery would yield more
-                            accurate build graph at the cost of slower query
-                            execution. When this is set, one usually also wants
-                            to set `--cqueryCommandOptions` to specify a
-                            targeting platform. Note that this flag only works
-                            with Bazel 6.2.0 or above because lower versions
-                            does not support `--query_file` flag.
-  -v, --verbose           Display query string, missing files and elapsed time
-  -V, --version           Print version information and exit.
-  -w, --workspacePath=<workspacePath>
-                          Path to Bazel workspace directory.
+Write canonical hashes for Bazel targets in a workspace
+
+Usage: bazel-diff generate-hashes [OPTIONS] --workspacePath <WORKSPACE_PATH> [OUTPUT_PATH]
+
+Arguments:
+  [OUTPUT_PATH]  
+
+Options:
+  -v, --verbose
+          
+  -w, --workspacePath <WORKSPACE_PATH>
+          Path to the Bazel workspace
+  -b, --bazelPath <BAZEL_PATH>
+          Path to the Bazel or Bazelisk executable [default: bazel]
+  -s, --seed-filepaths <SEED_FILEPATHS>
+          File containing workspace-relative paths whose contents seed every target hash
+      --bazelStartupOptions <BAZEL_STARTUP_OPTIONS>
+          Additional space-separated Bazel startup options
+      --bazelCommandOptions <BAZEL_COMMAND_OPTIONS>
+          Additional space-separated `bazel query` options
+      --cqueryCommandOptions <CQUERY_COMMAND_OPTIONS>
+          Additional space-separated `bazel cquery` options
+      --fineGrainedHashExternalRepos <FINE_GRAINED_HASH_EXTERNAL_REPOS>
+          
+      --fineGrainedHashExternalReposFile <FINE_GRAINED_HASH_EXTERNAL_REPOS_FILE>
+          
+      --useCquery[=<USE_CQUERY>]
+          [default: false] [possible values: true, false]
+      --cqueryExpression <CQUERY_EXPRESSION>
+          
+  -k, --keep_going[=<KEEP_GOING>]
+          [default: false] [possible values: true, false]
+      --ignoredRuleHashingAttributes <IGNORED_RULE_HASHING_ATTRIBUTES>
+          
+      --excludeExternalTargets[=<EXCLUDE_EXTERNAL_TARGETS>]
+          [default: false] [possible values: true, false]
+      --excludeTargetsQuery <EXCLUDE_TARGETS_QUERY>
+          
+      --alwaysAffectedTags <ALWAYS_AFFECTED_TAGS>
+          
+      --contentHashPath <CONTENT_HASH_PATH>
+          
+      --includeTargetType[=<INCLUDE_TARGET_TYPE>]
+          [default: false] [possible values: true, false]
+      --targetType <TARGET_TYPE>
+          
+  -d, --depEdgesFile <DEP_EDGES_FILE>
+          
+  -m, --modified-filepaths <MODIFIED_FILEPATHS>
+          
+  -h, --help
+          Print help
+  -V, --version
+          Print version
 ```
 
 ### `get-impacted-targets` command
 
 ```terminal
-Missing required options: '--startingHashes=<startingHashesJSONPath>', '--finalHashes=<finalHashesJSONPath>', '--workspacePath=<workspacePath>'
-Usage: bazel-diff get-impacted-targets [-v] [--[no-]excludeExternalTargets] [--
-                                       [no-]noBazelrc] [-b=<bazelPath>]
-                                       [-d=<depsMappingJSONPath>]
-                                       -fh=<finalHashesJSONPath>
-                                       [-o=<outputPath>]
-                                       -sh=<startingHashesJSONPath>
-                                       -w=<workspacePath>
-                                       [-so=<bazelStartupOptions>]...
-                                       [-tt=<targetType>[,<targetType>...]]...
-Command-line utility to analyze the state of the bazel build graph
-  -b, --bazelPath=<bazelPath>
-                         Path to Bazel binary. If not specified, the Bazel
-                           binary available in PATH will be used.
-  -d, --depEdgesFile=<depsMappingJSONPath>
-                         Path to the file where dependency edges are. If
-                           specified, build graph distance metrics will be
-                           computed from the given hash data.
-      --[no-]excludeExternalTargets
-                         If true, drop labels starting with '//external:' from
-                           the impacted-targets output. These synthetic labels
-                           are produced for bzlmod-managed external repos so
-                           generate-hashes can detect dep changes, but they are
-                           not buildable in bzlmod-only mode (Bazel 8.6.0+ with
-                           --enable_workspace=false) and will fail downstream
-                           `bazel build`. See https://github.
-                           com/Tinder/bazel-diff/issues/326. When unset,
-                           defaults to true if Bzlmod is detected (via `bazel
-                           mod graph`), false otherwise.
-      -fh, --finalHashes=<finalHashesJSONPath>
-                         The path to the JSON file of target hashes for the
-                           final revision. Run 'generate-hashes' to get this
-                           value.
-      --[no-]noBazelrc   Don't use .bazelrc
-  -o, --output=<outputPath>
-                         Filepath to write the impacted Bazel targets to. If
-                           using depEdgesFile: formatted in json, otherwise:
-                           newline separated. If not specified, the output will
-                           be written to STDOUT.
-      -sh, --startingHashes=<startingHashesJSONPath>
-                         The path to the JSON file of target hashes for the
-                           initial revision. Run 'generate-hashes' to get this
-                           value.
-      -so, --bazelStartupOptions=<bazelStartupOptions>
-                         Additional space separated Bazel client startup
-                           options used when invoking Bazel
-      -tt, --targetType=<targetType>[,<targetType>...]
-                         The types of targets to filter. Use comma (,) to
-                           separate multiple values, e.g.
-                           '--targetType=SourceFile,Rule,GeneratedFile'.
-  -v, --verbose          Display query string, missing files and elapsed time
-  -w, --workspacePath=<workspacePath>
-                         Path to Bazel workspace directory. Required for module
-                           change detection.
+Compare two hash files and report impacted targets
+
+Usage: bazel-diff get-impacted-targets [OPTIONS] --startingHashes <STARTING_HASHES> --finalHashes <FINAL_HASHES> --workspacePath <WORKSPACE_PATH>
+
+Options:
+      --startingHashes <STARTING_HASHES>
+          
+  -v, --verbose
+          
+      --finalHashes <FINAL_HASHES>
+          
+  -d, --depEdgesFile <DEP_EDGES_FILE>
+          
+      --targetType <TARGET_TYPE>
+          
+  -o, --output <OUTPUT>
+          
+  -w, --workspacePath <WORKSPACE_PATH>
+          
+  -b, --bazelPath <BAZEL_PATH>
+          [default: bazel]
+      --bazelStartupOptions <BAZEL_STARTUP_OPTIONS>
+          
+      --noBazelrc[=<NO_BAZELRC>]
+          [default: false] [possible values: true, false]
+      --excludeExternalTargets[=<EXCLUDE_EXTERNAL_TARGETS>]
+          [possible values: true, false]
+  -h, --help
+          Print help
+  -V, --version
+          Print version
+```
+
+### `explain` command
+
+```terminal
+Explain why a target was impacted: the upstream target(s) whose own hash changed, and the dependency path from each down to the queried target. Renders as text, JSON, Graphviz DOT, or a Mermaid flowchart.
+
+Usage: bazel-diff explain [OPTIONS] --startingHashes <STARTING_HASHES> --finalHashes <FINAL_HASHES> --depEdgesFile <DEP_EDGES_FILE> --target <TARGET>
+
+Options:
+      --startingHashes <STARTING_HASHES>
+          The JSON file of target hashes for the initial revision, from `generate-hashes`
+
+  -v, --verbose
+          
+
+      --finalHashes <FINAL_HASHES>
+          The JSON file of target hashes for the final revision, from `generate-hashes`
+
+  -d, --depEdgesFile <DEP_EDGES_FILE>
+          The dependency-edges file written by `generate-hashes --depEdgesFile`. Required: attribution is a walk over these edges
+
+  -t, --target <TARGET>
+          The impacted Bazel label to explain, e.g. '//service/a:app'
+
+  -f, --format <FORMAT>
+          Output format
+
+          Possible values:
+          - text
+          - json
+          - dot:     A Graphviz node-link graph of the blame subgraph, edges from root cause to queried target
+          - mermaid: A Mermaid `flowchart TD` of the same graph
+          
+          [default: text]
+
+  -o, --output <OUTPUT>
+          Filepath to write the explanation to. Defaults to STDOUT
+
+      --maxRootCauses <MAX_ROOT_CAUSES>
+          Report at most this many root causes, nearest first. The full count is always reported alongside. 0 means no limit
+          
+          [default: 25]
+
+      --maxDepth <MAX_DEPTH>
+          Stop searching this many dependency hops above the queried target. Root causes further upstream are then not reported (a warning is printed). -1 means no bound
+          
+          [default: -1]
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version
 ```
 
 ### `serve` command
 
 ```terminal
-Usage: bazel-diff serve [-hkvV] [--[no-]excludeExternalTargets]
-                        [--no-initial-fetch] [--[no-]s3ForcePathStyle] [--[no-]
-                        trackDeps] [--[no-]useCquery] [-b=<bazelPath>]
-                        --cacheDir=<cacheDir> [--cacheMaxAge=<cacheMaxAge>]
-                        [--cacheMaxEntries=<cacheMaxEntries>]
-                        [--cacheMaxSize=<cacheMaxSize>]
-                        [--cachePruneInterval=<cachePruneInterval>]
-                        [--cqueryExpression=<cqueryExpression>]
-                        [--excludeTargetsQuery=<excludeTargetsQuery>]
-                        [--fineGrainedHashExternalReposFile=<fineGrainedHashExte
-                        rnalReposFile>] [--gitPath=<gitPath>] [--port=<port>]
-                        [--portFile=<portFile>]
-                        [--requestTimeout=<requestTimeoutSeconds>]
-                        [-s=<seedFilepaths>] [--s3Bucket=<s3Bucket>]
-                        [--s3Endpoint=<s3Endpoint>] [--s3Prefix=<s3Prefix>]
-                        [--s3Region=<s3Region>] -w=<workspacePath>
-                        [-co=<bazelCommandOptions>]...
-                        [--cqueryCommandOptions=<cqueryCommandOptions>]...
-                        [--fineGrainedHashExternalRepos=<fineGrainedHashExternal
-                        Repos>]...
-                        [--ignoredRuleHashingAttributes=<ignoredRuleHashingAttri
-                        butes>]... [-so=<bazelStartupOptions>]...
-                        [--warmupRevision=<warmupRevisions>]...
-Runs bazel-diff as a long-running HTTP query service that returns the impacted
-targets between two git revisions, caching generated hashes per commit SHA.
-  -b, --bazelPath=<bazelPath>
-                            Path to Bazel binary. If not specified, the Bazel
-                              binary available in PATH will be used.
-      --cacheDir=<cacheDir> Directory where generated hashes are cached per
-                              commit SHA. Persists across restarts.
-      --cacheMaxAge=<cacheMaxAge>
-                            Evict cached hashes not read or written within this
-                              window, so the cache does not grow without bound
-                              over time. Duration like 7d, 36h, 90m (units
-                              d/h/m/s). Unset means no age limit. Enforced by a
-                              background sweeper (see --cachePruneInterval).
-      --cacheMaxEntries=<cacheMaxEntries>
-                            Keep at most this many cached commit-SHA entries,
-                              evicting the least-recently-used first. Unset
-                              means no count limit.
-      --cacheMaxSize=<cacheMaxSize>
-                            Keep the cache's total on-disk size at or below
-                              this, evicting the least-recently-used entries
-                              first. Size like 10GB, 500MB, or a bare byte
-                              count (base 1024). Unset means no size limit.
-      --cachePruneInterval=<cachePruneInterval>
-                            How often the background sweeper enforces the
-                              --cacheMax* limits. Duration like 1h, 30m.
-                              Defaults to 1h. No effect unless a --cacheMax*
-                              limit is set.
-      -co, --bazelCommandOptions=<bazelCommandOptions>
-                            Additional space separated Bazel command options
-                              used when invoking `bazel query`
-      --cqueryCommandOptions=<cqueryCommandOptions>
-                            Additional space separated Bazel command options
-                              used when invoking `bazel cquery`. No effect
-                              unless --useCquery is set.
-      --cqueryExpression=<cqueryExpression>
-                            Custom cquery expression to use instead of the
-                              default. No effect unless --useCquery.
-      --[no-]excludeExternalTargets
-                            If true, exclude external targets (do not query
-                              //external:all-targets).
-      --excludeTargetsQuery=<excludeTargetsQuery>
-                            A Bazel query expression whose matched targets are
-                              excluded from the served hashes via the `except`
-                              operator, e.g. `manual`-tagged targets:
-                              --excludeTargetsQuery='attr("tags", "[\[ ]manual[,
-                              \]]", //...)'.
-      --fineGrainedHashExternalRepos=<fineGrainedHashExternalRepos>
-                            Comma separated list of external repos for which
-                              fine-grained hashes are computed.
-      --fineGrainedHashExternalReposFile=<fineGrainedHashExternalReposFile>
-                            A text file with a newline separated list of
-                              external repos. Mutually exclusive with
-                              --fineGrainedHashExternalRepos.
-      --gitPath=<gitPath>   Path to the git binary used for fetch/checkout
-                              operations. Defaults to 'git' on the PATH.
-  -h, --help                Show this help message and exit.
-      --ignoredRuleHashingAttributes=<ignoredRuleHashingAttributes>
-                            Attributes that should be ignored when hashing rule
-                              targets.
-  -k, --[no-]keep_going     Run `bazel query` with --keep_going. Defaults to
-                              false.
-      --no-initial-fetch    Skip the initial 'git fetch' before reporting
-                              healthy. Useful for local/offline testing.
-      --port=<port>         Port to listen on. Defaults to 8080. Pass 0 to bind
-                              any free port, and --portFile to find out which
-                              one.
-      --portFile=<portFile> Write the bound port to this file once the server
-                              is listening. The point is '--port 0 --portFile
-                              <path>': a caller that picks a port itself has to
-                              open a socket to find a free one and close it
-                              again before this process can bind, and anything
-                              else on the machine can take the port in between.
-                              Binding 0 and reporting back has no such window.
-                              The file appears only after the bind succeeds, so
-                              waiting for it is also waiting for the listener.
-      --requestTimeout=<requestTimeoutSeconds>
-                            Maximum seconds an /impacted_targets
-                              (_with_distances) or /dependency_edges request
-                              may run before the server abandons it and
-                              responds 504. 0 (the default) means no timeout.
-                              This bounds the request the client waits on; an
-                              in-flight bazel query may keep running in the
-                              background and still populate the per-SHA cache.
-  -s, --seed-filepaths=<seedFilepaths>
-                            A text file with a newline separated list of
-                              filepaths used as a SHA256 seed for all targets.
-      --s3Bucket=<s3Bucket> S3 bucket used as a shared hash cache behind the
-                              local --cacheDir tier. Generated hashes are
-                              published to the bucket and local cache misses
-                              fall back to it, so replicas behind a load
-                              balancer share one cache. Credentials and region
-                              come from the AWS default provider chains (env
-                              vars, profile, IRSA, IMDS). Unset (the default)
-                              means local-disk caching only.
-      --s3Endpoint=<s3Endpoint>
-                            Custom S3 endpoint URL for S3-compatible stores
-                              (MinIO, LocalStack). Usually combined with
-                              --s3ForcePathStyle.
-      --[no-]s3ForcePathStyle
-                            Use path-style S3 addressing (bucket in the URL
-                              path, not the hostname), required by most
-                              S3-compatible stores. Defaults to false.
-      --s3Prefix=<s3Prefix> Key prefix for cache objects in --s3Bucket, e.g.
-                              'bazel-diff/my-repo'. Defaults to no prefix
-                              (objects at the bucket root).
-      --s3Region=<s3Region> AWS region of --s3Bucket. Defaults to the SDK's
-                              default region chain (env vars, profile, IMDS).
-      -so, --bazelStartupOptions=<bazelStartupOptions>
-                            Additional space separated Bazel client startup
-                              options used when invoking Bazel
-      --[no-]trackDeps      Track dependency edges and persist them per commit
-                              SHA so build-graph distance metrics can be served
-                              via /impacted_targets_with_distances and the
-                              generate-hashes graph via /dependency_edges.
-                              Increases cache size and memory. Defaults to
-                              false.
-      --[no-]useCquery      If true, use cquery instead of query when
-                              generating dependency graphs.
-  -v, --verbose             Display query string, missing files and elapsed time
-  -V, --version             Print version information and exit.
-  -w, --workspacePath=<workspacePath>
-                            Path to the Bazel workspace git clone the service
-                              checks out and queries.
-      --warmupRevision=<warmupRevisions>
-                            Comma separated git revisions (branch/tag/SHA)
-                              whose hashes are generated and cached at startup,
-                              before the server reports healthy, so the first
-                              real request is warm and the Bazel analysis
-                              server is primed. Best-effort: a revision that
-                              fails to warm is logged and the server still
-                              becomes ready (serving it cold on demand).
-                              Increases time-to-healthy, so size
-                              deploy/health-check timeouts accordingly.
+Run the HTTP impacted-target query service
+
+Usage: bazel-diff serve [OPTIONS] --workspacePath <WORKSPACE_PATH> --cacheDir <CACHE_DIR>
+
+Options:
+  -v, --verbose
+          
+  -w, --workspacePath <WORKSPACE_PATH>
+          Path to the Bazel workspace
+  -b, --bazelPath <BAZEL_PATH>
+          Path to the Bazel or Bazelisk executable [default: bazel]
+  -s, --seed-filepaths <SEED_FILEPATHS>
+          File containing workspace-relative paths whose contents seed every target hash
+      --bazelStartupOptions <BAZEL_STARTUP_OPTIONS>
+          Additional space-separated Bazel startup options
+      --bazelCommandOptions <BAZEL_COMMAND_OPTIONS>
+          Additional space-separated `bazel query` options
+      --cqueryCommandOptions <CQUERY_COMMAND_OPTIONS>
+          Additional space-separated `bazel cquery` options
+      --fineGrainedHashExternalRepos <FINE_GRAINED_HASH_EXTERNAL_REPOS>
+          
+      --fineGrainedHashExternalReposFile <FINE_GRAINED_HASH_EXTERNAL_REPOS_FILE>
+          
+      --useCquery[=<USE_CQUERY>]
+          [default: false] [possible values: true, false]
+      --cqueryExpression <CQUERY_EXPRESSION>
+          
+  -k, --keep_going[=<KEEP_GOING>]
+          [default: false] [possible values: true, false]
+      --ignoredRuleHashingAttributes <IGNORED_RULE_HASHING_ATTRIBUTES>
+          
+      --excludeExternalTargets[=<EXCLUDE_EXTERNAL_TARGETS>]
+          [default: false] [possible values: true, false]
+      --excludeTargetsQuery <EXCLUDE_TARGETS_QUERY>
+          
+      --alwaysAffectedTags <ALWAYS_AFFECTED_TAGS>
+          
+      --gitPath <GIT_PATH>
+          [default: git]
+      --port <PORT>
+          [default: 8080]
+      --requestTimeout <REQUEST_TIMEOUT>
+          [default: 0]
+      --cacheDir <CACHE_DIR>
+          
+      --trackDeps[=<TRACK_DEPS>]
+          [default: false] [possible values: true, false]
+      --dependencyFingerprint[=<DEPENDENCY_FINGERPRINT>]
+          Opt-in: only serve cached entries whose external-dependency fingerprint still matches [default: false] [possible values: true, false]
+      --no-initial-fetch
+          
+      --warmupRevision <WARMUP_REVISIONS>
+          
+      --cacheMaxAge <CACHE_MAX_AGE>
+          
+      --cacheMaxEntries <CACHE_MAX_ENTRIES>
+          
+      --cacheMaxSize <CACHE_MAX_SIZE>
+          
+      --cachePruneInterval <CACHE_PRUNE_INTERVAL>
+          [default: 1h]
+      --s3Bucket <S3_BUCKET>
+          
+      --s3Prefix <S3_PREFIX>
+          [default: ""]
+      --s3Region <S3_REGION>
+          
+      --s3Endpoint <S3_ENDPOINT>
+          
+      --s3ForcePathStyle
+          
+      --nexusUrl <NEXUS_URL>
+          Base URL of a Sonatype Nexus Repository instance used as the shared cache tier
+      --nexusRepository <NEXUS_REPOSITORY>
+          Raw hosted repository on --nexusUrl that holds cache entries
+      --nexusPrefix <NEXUS_PREFIX>
+          [default: ""]
+      --nexusUsername <NEXUS_USERNAME>
+          Basic-auth user; the password is read from the BAZEL_DIFF_NEXUS_PASSWORD environment variable [env: BAZEL_DIFF_NEXUS_USERNAME=]
+      --nexusCaCert <NEXUS_CA_CERT>
+          PEM bundle of extra CA certificates to trust for --nexusUrl
+  -h, --help
+          Print help
+  -V, --version
+          Print version
 ```
 <!-- END_SECTION: cli-help -->
 
@@ -723,124 +714,90 @@ content of the file are converted into a SHA256 value.
 
 ## Installing
 
-### Integrate into your project (recommended)
+### Prebuilt binaries (recommended)
 
-First, add the following snippet to your project:
+Every [release](https://github.com/Tinder/bazel-diff/releases) includes platform binaries.
+Linux binaries are statically linked with musl:
 
-#### Bzlmod snippet
+```terminal
+# Linux amd64
+curl -Lo bazel-diff https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-linux-amd64
+chmod +x bazel-diff
+
+# Linux arm64
+curl -Lo bazel-diff https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-linux-arm64
+chmod +x bazel-diff
+
+# macOS arm64
+curl -Lo bazel-diff https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-macos-arm64
+chmod +x bazel-diff
+```
+
+Windows amd64: download `bazel-diff-rust-windows-amd64.exe` from the
+[latest release](https://github.com/Tinder/bazel-diff/releases/latest).
+
+### Integrate into your project
+
+With Bazel 8 or higher, add the following to your `MODULE.bazel`:
 
 ```bazel
-bazel_dep(name = "bazel-diff", version = "46.0.0")
+bazel_dep(name = "bazel-diff", version = "50.1.0")
 ```
+
+Until `rules_rs` fixes `all_crate_deps(package_name = "")`, copy
+[`rules_rs_package_name.patch`](patches/rules_rs_package_name.patch) into your
+workspace root and add this override to the same `MODULE.bazel`:
+
+```bazel
+single_version_override(
+    module_name = "rules_rs",
+    version = "0.0.112",
+    patch_strip = 1,
+    patches = ["//:rules_rs_package_name.patch"],
+)
+```
+
+Bazel only applies overrides from the root module.
 
 You can now run the tool with:
 
 ```terminal
-bazel run @bazel-diff//cli:bazel-diff
+bazel run @bazel-diff//:bazel-diff -- --help
 ```
 
-#### WORKSPACE snippet
+On Windows, add `--host_platform=@bazel-diff//platforms:windows_msvc` and
+`--legacy_external_runfiles` before `--`. Windows builds need Visual Studio with the
+C++ build tools installed.
+Bazel does not read a dependency's `.bazelrc`.
 
-```bazel
-http_jar = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_jar")
-http_jar(
-    name = "bazel-diff",
-    urls = [
-        "https://github.com/Tinder/bazel-diff/releases/download/7.0.0/bazel-diff_deploy.jar"
-    ],
-    sha256 = "0b9e32f9c20e570846b083743fe967ae54d13e2a1f7364983e0a7792979442be",
-)
-```
-
-Second, add in your root `BUILD.bazel` file:
-
-```bazel
-load("@rules_java//java:defs.bzl", "java_binary")
-
-java_binary(
-    name = "bazel-diff",
-    main_class = "com.bazel_diff.Main",
-    runtime_deps = ["@bazel-diff//jar"],
-)
-```
-
-That's it! You can now run the tool with:
-
-```terminal
-bazel run //:bazel-diff
-```
-
-> Note, in releases prior to 2.0.0 the value for the `main_class` attribute is just `BazelDiff`
-
-### Run Via JAR Release
-
-```terminal
-curl -Lo bazel-diff.jar https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff_deploy.jar
-java -jar bazel-diff.jar -h
-```
+Bzlmod is required; `@bazel-diff//:bazel-diff-rust` is an alias for the same binary.
 
 ### Build from Source
 
-After cloning down the repo, you are good to go, Bazel will handle the rest
-
-To run the project
+Use Bazel 8 or higher. Bazel downloads the Rust and C/C++ toolchains:
 
 ```terminal
-bazel run :bazel-diff -- bazel-diff -h
+bazel run :bazel-diff -- --help
 ```
+
+Release binaries are written to `bazel-bin/release/bazel-diff-rust-<os>-<arch>[.exe]`:
+
+```terminal
+make release_rust_binary              # bazel build //release:bazel-diff-rust --config=release
+make release_rust_binary_linux        # ... --config=release-linux
+make release_rust_binary_linux_arm64  # ... --config=release-linux-arm64
+```
+
+`--config=release-linux` and `--config=release-linux-arm64` build static musl
+binaries for amd64 and arm64, respectively. Both support cross-compilation from
+Linux and Apple Silicon macOS.
 
 #### Debugging (when running from source)
 
 To run `bazel-diff` with debug logging, run your commands with the `verbose` config like so:
 
 ```terminal
-bazel run :bazel-diff --config=verbose -- bazel-diff -h
-```
-
-### Build your own deployable JAR
-
-```terminal
-bazel build //cli:bazel-diff_deploy.jar
-java -jar bazel-bin/cli/bazel-diff_deploy.jar # This JAR can be run anywhere
-```
-
-### Build from source in your Bazel Project
-
-Add the following to your `WORKSPACE` file to add the external repositories, replacing the `RELEASE_ARCHIVE_URL` with the archive url of the bazel-diff release you wish to depend on:
-
-```bazel
-load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
-
-http_archive(
-  name = "bazel-diff",
-  urls = [
-        "RELEASE_ARCHIVE_URL",
-    ],
-    sha256 = "UPDATE_ME",
-    strip_prefix = "UPDATE_ME"
-)
-
-load("@bazel-diff//:repositories.bzl", "bazel_diff_dependencies")
-
-bazel_diff_dependencies()
-
-load("@rules_jvm_external//:defs.bzl", "maven_install")
-load("@bazel-diff//:artifacts.bzl", "BAZEL_DIFF_MAVEN_ARTIFACTS")
-
-maven_install(
-    name = "bazel_diff_maven",
-    artifacts = BAZEL_DIFF_MAVEN_ARTIFACTS,
-    repositories = [
-        "http://uk.maven.org/maven2",
-        "https://jcenter.bintray.com/",
-    ],
-)
-```
-
-Now you can simply run `bazel-diff` from your project:
-
-```terminal
-bazel run @bazel-diff//cli:bazel-diff -- bazel-diff -h
+bazel run :bazel-diff --config=verbose -- --help
 ```
 
 ## Contributors
@@ -849,66 +806,71 @@ bazel run @bazel-diff//cli:bazel-diff -- bazel-diff -h
 <table>
   <tr>
     <td align="center"><a href="https://github.com/tinder-maxwellelliott"><img src="https://avatars.githubusercontent.com/u/56700854?s=64" width="64" alt="Maxwell Elliott"/><br/><sub><b>Maxwell Elliott</b></sub></a></td>
-    <td align="center"><a href="https://github.com/honnix"><img src="https://avatars.githubusercontent.com/u/158892?s=64" width="64" alt="Honnix"/><br/><sub><b>Honnix</b></sub></a></td>
-    <td align="center"><a href="https://github.com/fa93hws"><img src="https://avatars.githubusercontent.com/u/10626756?s=64" width="64" alt="eric wang"/><br/><sub><b>eric wang</b></sub></a></td>
-    <td align="center"><a href="https://github.com/fa93hws"><img src="https://avatars.githubusercontent.com/u/10626756?s=64" width="64" alt="Eric Wang"/><br/><sub><b>Eric Wang</b></sub></a></td>
-    <td align="center"><a href="https://github.com/tgeng"><img src="https://avatars.githubusercontent.com/u/29584386?s=64" width="64" alt="Tianyu Geng"/><br/><sub><b>Tianyu Geng</b></sub></a></td>
-    <td align="center"><a href="https://github.com/BalestraPatrick"><img src="https://avatars.githubusercontent.com/u/3658887?s=64" width="64" alt="Patrick Balestra"/><br/><sub><b>Patrick Balestra</b></sub></a></td>
+    <td align="center"><a href="https://github.com/honnix"><img src="https://avatars.githubusercontent.com/honnix?s=64" width="64" alt="Honnix"/><br/><sub><b>Honnix</b></sub></a></td>
+    <td align="center"><sub><b>eric wang</b></sub></td>
+    <td align="center"><sub><b>Eric Wang</b></sub></td>
+    <td align="center"><sub><b>Tianyu Geng</b></sub></td>
+    <td align="center"><sub><b>Patrick Balestra</b></sub></td>
   </tr>
   <tr>
-    <td align="center"><a href="https://github.com/purkhusid"><img src="https://avatars.githubusercontent.com/u/5622403?s=64" width="64" alt="Daniel P. Purkhus"/><br/><sub><b>Daniel P. Purkhus</b></sub></a></td>
-    <td align="center"><a href="https://github.com/alexeagle"><img src="https://avatars.githubusercontent.com/u/47395?s=64" width="64" alt="Alex Eagle"/><br/><sub><b>Alex Eagle</b></sub></a></td>
-    <td align="center"><a href="https://github.com/Malinskiy"><img src="https://avatars.githubusercontent.com/u/2089114?s=64" width="64" alt="Anton Malinskiy"/><br/><sub><b>Anton Malinskiy</b></sub></a></td>
-    <td align="center"><a href="https://github.com/rdark"><img src="https://avatars.githubusercontent.com/u/260691?s=64" width="64" alt="rdark"/><br/><sub><b>rdark</b></sub></a></td>
+    <td align="center"><sub><b>Daniel P. Purkhus</b></sub></td>
+    <td align="center"><sub><b>Alex Eagle</b></sub></td>
+    <td align="center"><sub><b>Anton Malinskiy</b></sub></td>
+    <td align="center"><a href="https://github.com/rdark"><img src="https://avatars.githubusercontent.com/rdark?s=64" width="64" alt="rdark"/><br/><sub><b>rdark</b></sub></a></td>
+    <td align="center"><a href="https://github.com/ViggedalZenseact"><img src="https://avatars.githubusercontent.com/u/174004696?s=64" width="64" alt="ViggedalZenseact"/><br/><sub><b>ViggedalZenseact</b></sub></a></td>
     <td align="center"><a href="https://github.com/corypaik"><img src="https://avatars.githubusercontent.com/u/36490981?s=64" width="64" alt="Cory Paik"/><br/><sub><b>Cory Paik</b></sub></a></td>
-    <td align="center"><a href="https://github.com/thirtyseven"><img src="https://avatars.githubusercontent.com/u/123678?s=64" width="64" alt="Ted Kaplan"/><br/><sub><b>Ted Kaplan</b></sub></a></td>
   </tr>
   <tr>
-    <td align="center"><a href="https://github.com/sharmila-oai"><img src="https://avatars.githubusercontent.com/u/257629015?s=64" width="64" alt="Sharmila"/><br/><sub><b>Sharmila</b></sub></a></td>
-    <td align="center"><a href="https://github.com/dkostyrev"><img src="https://avatars.githubusercontent.com/u/183590?s=64" width="64" alt="Dmitrii Kostyrev"/><br/><sub><b>Dmitrii Kostyrev</b></sub></a></td>
-    <td align="center"><a href="https://github.com/jmthvt"><img src="https://avatars.githubusercontent.com/u/1737199?s=64" width="64" alt="Jérémy Mathevet"/><br/><sub><b>Jérémy Mathevet</b></sub></a></td>
-    <td align="center"><a href="https://github.com/nikhilbirmiwal"><img src="https://avatars.githubusercontent.com/u/65141192?s=64" width="64" alt="Nikhil Birmiwal"/><br/><sub><b>Nikhil Birmiwal</b></sub></a></td>
-    <td align="center"><a href="https://github.com/morozov"><img src="https://avatars.githubusercontent.com/u/59683?s=64" width="64" alt="Sergei Morozov"/><br/><sub><b>Sergei Morozov</b></sub></a></td>
-    <td align="center"><a href="https://github.com/fahhem"><img src="https://avatars.githubusercontent.com/u/306100?s=64" width="64" alt="Fahrzin Hemmati"/><br/><sub><b>Fahrzin Hemmati</b></sub></a></td>
+    <td align="center"><sub><b>Ted Kaplan</b></sub></td>
+    <td align="center"><sub><b>Sharmila</b></sub></td>
+    <td align="center"><a href="https://github.com/dkostyrev"><img src="https://avatars.githubusercontent.com/dkostyrev?s=64" width="64" alt="Dmitrii Kostyrev"/><br/><sub><b>Dmitrii Kostyrev</b></sub></a></td>
+    <td align="center"><sub><b>Jérémy Mathevet</b></sub></td>
+    <td align="center"><sub><b>Nikhil Birmiwal</b></sub></td>
+    <td align="center"><sub><b>Sergei Morozov</b></sub></td>
   </tr>
   <tr>
-    <td align="center"><a href="https://github.com/JaimeLennox"><img src="https://avatars.githubusercontent.com/u/1424638?s=64" width="64" alt="Jaime Lennox"/><br/><sub><b>Jaime Lennox</b></sub></a></td>
+    <td align="center"><a href="https://github.com/fahhem"><img src="https://avatars.githubusercontent.com/fahhem?s=64" width="64" alt="Fahrzin Hemmati"/><br/><sub><b>Fahrzin Hemmati</b></sub></a></td>
+    <td align="center"><sub><b>Jaime Lennox</b></sub></td>
+    <td align="center"><a href="https://github.com/dzbarsky"><img src="https://avatars.githubusercontent.com/u/1565842?s=64" width="64" alt="David Zbarsky"/><br/><sub><b>David Zbarsky</b></sub></a></td>
+    <td align="center"><a href="https://github.com/q4rk"><img src="https://avatars.githubusercontent.com/u/214901060?s=64" width="64" alt="Eje Daniel"/><br/><sub><b>Eje Daniel</b></sub></a></td>
+    <td align="center"><a href="https://github.com/lukasmi93"><img src="https://avatars.githubusercontent.com/u/194943870?s=64" width="64" alt="lukasmi93"/><br/><sub><b>lukasmi93</b></sub></a></td>
     <td align="center"><a href="https://github.com/tinder-cwybranowski"><img src="https://avatars.githubusercontent.com/u/40372184?s=64" width="64" alt="Connor Wybranowski"/><br/><sub><b>Connor Wybranowski</b></sub></a></td>
+  </tr>
+  <tr>
     <td align="center"><a href="https://github.com/ihasdapie"><img src="https://avatars.githubusercontent.com/u/54821716?s=64" width="64" alt="Brian"/><br/><sub><b>Brian</b></sub></a></td>
     <td align="center"><a href="https://github.com/hazel-sudzilouski-ai"><img src="https://avatars.githubusercontent.com/u/291898786?s=64" width="64" alt="hazel-sudzilouski-ai"/><br/><sub><b>hazel-sudzilouski-ai</b></sub></a></td>
     <td align="center"><a href="https://github.com/csmoe"><img src="https://avatars.githubusercontent.com/u/35686186?s=64" width="64" alt="csmoe"/><br/><sub><b>csmoe</b></sub></a></td>
     <td align="center"><a href="https://github.com/SimonFoobar648"><img src="https://avatars.githubusercontent.com/u/245426116?s=64" width="64" alt="SimonFoobar648"/><br/><sub><b>SimonFoobar648</b></sub></a></td>
-  </tr>
-  <tr>
-    <td align="center"><a href="https://github.com/ViggedalZenseact"><img src="https://avatars.githubusercontent.com/u/174004696?s=64" width="64" alt="ViggedalZenseact"/><br/><sub><b>ViggedalZenseact</b></sub></a></td>
     <td align="center"><a href="https://github.com/dgollahon-plaid"><img src="https://avatars.githubusercontent.com/u/179647366?s=64" width="64" alt="dgollahon-plaid"/><br/><sub><b>dgollahon-plaid</b></sub></a></td>
-    <td align="center"><a href="https://github.com/jmwachtel"><img src="https://avatars.githubusercontent.com/u/1046228?s=64" width="64" alt="jmwachtel"/><br/><sub><b>jmwachtel</b></sub></a></td>
-    <td align="center"><a href="https://github.com/Ahajha"><img src="https://avatars.githubusercontent.com/u/44127594?s=64" width="64" alt="Alex Trotta"/><br/><sub><b>Alex Trotta</b></sub></a></td>
-    <td align="center"><a href="https://github.com/nollbit"><img src="https://avatars.githubusercontent.com/u/99957?s=64" width="64" alt="Johan Mjönes"/><br/><sub><b>Johan Mjönes</b></sub></a></td>
-    <td align="center"><a href="https://github.com/lucasteixeira-cb"><img src="https://avatars.githubusercontent.com/u/116316841?s=64" width="64" alt="Lucas Teixeira"/><br/><sub><b>Lucas Teixeira</b></sub></a></td>
+    <td align="center"><sub><b>jmwachtel</b></sub></td>
   </tr>
   <tr>
-    <td align="center"><a href="https://github.com/GuillaumeVW"><img src="https://avatars.githubusercontent.com/u/53425033?s=64" width="64" alt="Guillaume Van Wassenhove"/><br/><sub><b>Guillaume Van Wassenhove</b></sub></a></td>
-    <td align="center"><a href="https://github.com/fmeum"><img src="https://avatars.githubusercontent.com/u/4312191?s=64" width="64" alt="Fabian Meumertzheim"/><br/><sub><b>Fabian Meumertzheim</b></sub></a></td>
-    <td align="center"><a href="https://github.com/blockjon-dd"><img src="https://avatars.githubusercontent.com/u/117850895?s=64" width="64" alt="Jonathan Block"/><br/><sub><b>Jonathan Block</b></sub></a></td>
-    <td align="center"><a href="https://github.com/alex-torok"><img src="https://avatars.githubusercontent.com/u/8749956?s=64" width="64" alt="Alex Torok"/><br/><sub><b>Alex Torok</b></sub></a></td>
-    <td align="center"><a href="https://github.com/naveenOnarayanan"><img src="https://avatars.githubusercontent.com/u/3528131?s=64" width="64" alt="Naveen Narayanan"/><br/><sub><b>Naveen Narayanan</b></sub></a></td>
-    <td align="center"><a href="https://github.com/OniOni"><img src="https://avatars.githubusercontent.com/u/385657?s=64" width="64" alt="Mathieu Sabourin"/><br/><sub><b>Mathieu Sabourin</b></sub></a></td>
+    <td align="center"><a href="https://github.com/Ahajha"><img src="https://avatars.githubusercontent.com/Ahajha?s=64" width="64" alt="Alex Trotta"/><br/><sub><b>Alex Trotta</b></sub></a></td>
+    <td align="center"><sub><b>Johan Mjönes</b></sub></td>
+    <td align="center"><a href="https://github.com/lucasteixeira-cb"><img src="https://avatars.githubusercontent.com/lucasteixeira-cb?s=64" width="64" alt="Lucas Teixeira"/><br/><sub><b>Lucas Teixeira</b></sub></a></td>
+    <td align="center"><a href="https://github.com/GuillaumeVW"><img src="https://avatars.githubusercontent.com/GuillaumeVW?s=64" width="64" alt="Guillaume Van Wassenhove"/><br/><sub><b>Guillaume Van Wassenhove</b></sub></a></td>
+    <td align="center"><sub><b>Fabian Meumertzheim</b></sub></td>
+    <td align="center"><a href="https://github.com/blockjon-dd"><img src="https://avatars.githubusercontent.com/blockjon-dd?s=64" width="64" alt="Jonathan Block"/><br/><sub><b>Jonathan Block</b></sub></a></td>
   </tr>
   <tr>
-    <td align="center"><a href="https://github.com/andre-alves"><img src="https://avatars.githubusercontent.com/u/7773955?s=64" width="64" alt="André"/><br/><sub><b>André</b></sub></a></td>
-    <td align="center"><a href="https://github.com/bz-canva"><img src="https://avatars.githubusercontent.com/u/125319243?s=64" width="64" alt="Boris"/><br/><sub><b>Boris</b></sub></a></td>
-    <td align="center"><a href="https://github.com/chenrui333"><img src="https://avatars.githubusercontent.com/u/1580956?s=64" width="64" alt="Rui Chen"/><br/><sub><b>Rui Chen</b></sub></a></td>
-    <td align="center"><a href="https://github.com/sanju-naik"><img src="https://avatars.githubusercontent.com/u/66404008?s=64" width="64" alt="Sanju Naik"/><br/><sub><b>Sanju Naik</b></sub></a></td>
-    <td align="center"><a href="https://github.com/lalten"><img src="https://avatars.githubusercontent.com/u/11611719?s=64" width="64" alt="Laurenz"/><br/><sub><b>Laurenz</b></sub></a></td>
-    <td align="center"><a href="https://github.com/molar"><img src="https://avatars.githubusercontent.com/u/1433210?s=64" width="64" alt="mla"/><br/><sub><b>mla</b></sub></a></td>
+    <td align="center"><sub><b>Alex Torok</b></sub></td>
+    <td align="center"><sub><b>Naveen Narayanan</b></sub></td>
+    <td align="center"><sub><b>Mathieu Sabourin</b></sub></td>
+    <td align="center"><sub><b>André</b></sub></td>
+    <td align="center"><a href="https://github.com/bz-canva"><img src="https://avatars.githubusercontent.com/bz-canva?s=64" width="64" alt="Boris"/><br/><sub><b>Boris</b></sub></a></td>
+    <td align="center"><sub><b>Rui Chen</b></sub></td>
   </tr>
   <tr>
-    <td align="center"><a href="https://github.com/tinder-yukisawa"><img src="https://avatars.githubusercontent.com/u/54122444?s=64" width="64" alt="tinder-yukisawa"/><br/><sub><b>tinder-yukisawa</b></sub></a></td>
-    <td align="center"><a href="https://github.com/KevinJiao"><img src="https://avatars.githubusercontent.com/u/9851473?s=64" width="64" alt="Kevin Jiao"/><br/><sub><b>Kevin Jiao</b></sub></a></td>
-    <td align="center"><a href="https://github.com/vcase"><img src="https://avatars.githubusercontent.com/u/10698795?s=64" width="64" alt="Vincent Case"/><br/><sub><b>Vincent Case</b></sub></a></td>
-    <td align="center"><a href="https://github.com/fh-wpanfil"><img src="https://avatars.githubusercontent.com/u/262680997?s=64" width="64" alt="Walt Panfil"/><br/><sub><b>Walt Panfil</b></sub></a></td>
-    <td align="center"><a href="https://github.com/mehran-prs"><img src="https://avatars.githubusercontent.com/u/22454054?s=64" width="64" alt="Mehran Poursadeghi"/><br/><sub><b>Mehran Poursadeghi</b></sub></a></td>
+    <td align="center"><a href="https://github.com/sanju-naik"><img src="https://avatars.githubusercontent.com/sanju-naik?s=64" width="64" alt="Sanju Naik"/><br/><sub><b>Sanju Naik</b></sub></a></td>
+    <td align="center"><a href="https://github.com/lalten"><img src="https://avatars.githubusercontent.com/lalten?s=64" width="64" alt="Laurenz"/><br/><sub><b>Laurenz</b></sub></a></td>
+    <td align="center"><sub><b>mla</b></sub></td>
+    <td align="center"><sub><b>tinder-yukisawa</b></sub></td>
+    <td align="center"><sub><b>Kevin Jiao</b></sub></td>
+    <td align="center"><sub><b>Vincent Case</b></sub></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Walt Panfil</b></sub></td>
+    <td align="center"><sub><b>Mehran Poursadeghi</b></sub></td>
   </tr>
 </table>
 <!-- END_SECTION: contributors -->
@@ -934,93 +896,34 @@ Precision CI at Scale: Target-Aware Workflows with Bazel Diff - Maxwell Elliott 
 
 ## Running the tests
 
-To run the tests simply run
+The unit tests, lint gates and tooling tests:
 
 ```terminal
-bazel test //...
+bazel test //:rust_tests //:rust_clippy_check //:rust_format_check //tools/...
 ```
 
-## Experimental Rust candidate
-
-This branch includes a proposed Rust implementation at `//:bazel-diff-rust`. The existing Kotlin
-implementation remains the default `//:bazel-diff` target and the released JAR.
+The end-to-end suite drives the real binary against fixture workspaces with a nested Bazel,
+one target per case (see [`tools/e2e/README.md`](tools/e2e/README.md)):
 
 ```terminal
-bazel run //:bazel-diff-rust -- --help
+bazel test //tests:e2e_test
 ```
-
-GitHub Releases also ship prebuilt binaries:
-
-```terminal
-# Linux amd64 (statically linked against musl -- no glibc requirement, so it
-# runs on any distribution, including Alpine and images older than the runner)
-curl -Lo bazel-diff-rust https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-linux-amd64
-chmod +x bazel-diff-rust
-
-# Linux arm64 (same musl static linking)
-curl -Lo bazel-diff-rust https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-linux-arm64
-chmod +x bazel-diff-rust
-
-# macOS arm64
-curl -Lo bazel-diff-rust https://github.com/Tinder/bazel-diff/releases/latest/download/bazel-diff-rust-macos-arm64
-chmod +x bazel-diff-rust
-```
-
-Windows amd64: download
-`bazel-diff-rust-windows-amd64.exe` from the
-[latest release](https://github.com/Tinder/bazel-diff/releases/latest).
-
-Those assets are produced by Bazel alone -- CI runs nothing but the commands below and uploads
-whatever lands in `bazel-bin/release/`, so `//release:bazel-diff-rust` names the binary for the
-platform it was built for (`bazel-diff-rust-<os>-<arch>`, plus `.exe` on Windows):
-
-```terminal
-make release_rust_binary              # bazel build //release:bazel-diff-rust --config=release
-make release_rust_binary_linux        # ... --config=release-musl
-make release_rust_binary_linux_arm64  # ... --config=release-musl-arm64
-```
-
-`--config=release-musl` and `--config=release-musl-arm64` target
-`//platforms:linux_x86_64_musl` and `//platforms:linux_aarch64_musl`, which select a musl Rust
-std and a musl C toolchain, so the Linux assets are statically linked instead of inheriting the
-build runner's glibc as a version floor. They are cross-compiles: the same commands produce
-`bazel-diff-rust-linux-amd64` and `bazel-diff-rust-linux-arm64` on a glibc Linux host and on an
-Apple Silicon Mac.
-
-### Performance gate
-
-The Rust candidate is expected to be faster than Kotlin, and CI enforces it. `make perf-gate`
-runs both binaries over generated workloads -- a synthetic `streamed_proto` graph plus hash-file
-pairs, with no real workspace, Bazel server or Hyperfine involved -- and exits non-zero unless
-Rust wins on median wall time, on start-up-adjusted wall time, and in every paired round.
-
-```terminal
-make perf-gate
-make perf-gate SCALE=4 ROUNDS=9 JSON=/tmp/perf-gate.json
-```
-
-Outputs are compared before timings are reported, so a "speedup" can never come from the two
-implementations doing different work. See
-[`docs/kotlin-rust-perf-gate.md`](docs/kotlin-rust-perf-gate.md) for the protocol, the workload
-list and what to do when the gate fails. For measuring the two implementations against a real
-repository instead, see [`docs/kotlin-vs-rust-benchmark.md`](docs/kotlin-vs-rust-benchmark.md).
 
 ## Code coverage
 
-CI enforces a minimum **90% line coverage** on production sources. Kotlin
-(`cli/src/main/...`), Go (`tools/go/...`), and the experimental Rust
-implementation (`src/...`) are gated **independently** at 90% each, so thin
-coverage in one language can't hide behind well-covered code in another. To
-run the same checks locally:
+CI enforces a minimum **90% line coverage** on production sources. Rust
+(`src/...`, `tools/coverage/src/...`) and Go (`tools/go/...`) are gated
+**independently** at 90% each, so thin coverage in one language can't hide
+behind well-covered code in another. To run the same checks locally:
 
 ```terminal
 make coverage
 ```
 
 This invokes
-`bazel coverage --combined_report=lcov //cli/... //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/...`
+`bazel coverage --combined_report=lcov //src:cli_tests //src:rust_tests //tools:coverage_check_test //tools/coverage/... //tools/go/...`
 and then runs `//tools:coverage-check` twice against the resulting LCOV report — once for
-the Kotlin main sources and once scoped to `tools/go/` (`--include tools/go/`). The check is
+the Rust sources and once scoped to `tools/go/` (`--include tools/go/`). The check is
 a Python `py_binary` ([`tools/coverage_check.py`](tools/coverage_check.py)) that prints a
 per-file table sorted by coverage (worst first), the overall percentage, and exits
 non-zero if the scoped coverage is below the threshold.
@@ -1053,14 +956,11 @@ coverage_enforced_test(
 ```
 
 The default minimum is 90%. Go (`//tools/go/sample:sample_test`), the Rust
-LCOV merger (`//tools/coverage:lcov_merger_test`), the experimental Rust
-implementation (`//src:cli_tests` and `//src:rust_tests`), and the
-primary-owner Kotlin/JVM tests under `//cli` all carry minimums. When a
+LCOV merger (`//tools/coverage:lcov_merger_test`) and the CLI itself
+(`//src:cli_tests` and `//src:rust_tests`) all carry minimums. When a
 target's merged report falls below its minimum, the coverage run fails that
 target and the test log contains a per-file breakdown. See
 [`tools/coverage/README.md`](tools/coverage/README.md) for details.
-The Kotlin-to-Rust applicability and parity decisions are tracked in
-[`docs/kotlin-rust-test-parity.md`](docs/kotlin-rust-test-parity.md).
 
 For an interactive HTML report (annotated source with covered/uncovered lines
 highlighted), use `make coverage-html`. This requires the `lcov` package

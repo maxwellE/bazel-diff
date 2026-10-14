@@ -55,7 +55,7 @@ target's real ancestry commits, so the clone must be deep enough (`--real-clone-
 
 Usage:
     tools/serve_stress.py                       # build, then run every hermetic phase
-    tools/serve_stress.py --skip-build          # reuse an existing bazel-bin/cli/bazel-diff
+    tools/serve_stress.py --skip-build          # reuse an existing bazel-bin/src/bazel-diff
     tools/serve_stress.py --quick               # reduced request counts (sanity profile)
     tools/serve_stress.py --only lock           # run only phases whose name contains "lock"
     tools/serve_stress.py --metrics-out m.json --summary-out s.md
@@ -905,8 +905,8 @@ def build_metrics_json(ctx: Ctx, wall_seconds: float, quick: bool, failures: int
 
 
 def build_summary_md(data: dict) -> str:
-    lines = ["# `bazel-diff serve` stress run", ""]
     meta = data["meta"]
+    lines = ["# `bazel-diff serve` stress run", ""]
     verdict = "✅ all checks passed" if data["failures"] == 0 else f"❌ {data['failures']} check(s) failed"
     profile_label = "real-repo" if meta.get("mode") == "real" else (
         "quick" if meta["quick"] else "full")
@@ -1309,6 +1309,8 @@ def fold_flag_values(argv: list, opts: tuple = FLAG_VALUED_OPTS) -> list:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="Stress `bazel-diff serve` and capture metrics.")
     ap.add_argument("--skip-build", action="store_true", help="reuse existing bazel-bin launcher")
+    ap.add_argument("--target", default=base.BUILD_TARGET,
+                     help="bazel-diff build target to stress (default: %(default)s)")
     ap.add_argument("--quick", action="store_true", help="reduced request counts")
     ap.add_argument("--only", default="", help="run only phases whose name contains this")
     ap.add_argument("--keep-artifacts", action="store_true", help="keep the temp workdir")
@@ -1350,8 +1352,8 @@ def main() -> int:
         return 2
 
     if not args.skip_build:
-        base.log(f"{base.C.BOLD}Building //cli:bazel-diff ...{base.C.RESET}")
-        base.run([base.BAZEL, "build", "//cli:bazel-diff"], cwd=base.REPO_ROOT)
+        base.log(f"{base.C.BOLD}Building {args.target} ...{base.C.RESET}")
+        base.run([base.BAZEL, "build", args.target], cwd=base.REPO_ROOT)
     if not base.LAUNCHER.exists():
         base.log(f"{base.C.RED}launcher not found at {base.LAUNCHER}; run without --skip-build{base.C.RESET}")
         return 2
