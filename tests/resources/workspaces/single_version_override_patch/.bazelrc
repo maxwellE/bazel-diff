@@ -1,0 +1,8 @@
+# patched_dep comes from the registry checked in next to this file, so the
+# fixture needs no network for the module under test. The archive it serves can
+# only be named by an absolute file:// URL, so the test writes
+# registry/modules/patched_dep/1.0.0/source.json (and zips registry/src/) after
+# copying the fixture; see support::publish_local_registry. Everything else
+# (bazel_tools' own deps) still resolves through the BCR.
+common --registry=file://%workspace%/registry
+common --registry=https://bcr.bazel.build

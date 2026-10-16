@@ -1,4 +1,5 @@
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
@@ -265,6 +266,94 @@ pub fn extract_fixture(name: &str) -> TestWorkspace {
         .extract(destination.path())
         .expect("extract zip fixture");
     TestWorkspace::new(destination)
+}
+
+/// Makes the Bazel registry a fixture checks in under `registry/` servable.
+///
+/// A registry's `source.json` names its archive by an absolute URL, which cannot be checked in
+/// for a fixture that lives wherever the test copies it. The fixture instead checks in each
+/// module's source tree under `registry/src/<name>-<version>/`; this zips every such tree into
+/// `registry/<name>-<version>.zip` and writes `registry/modules/<name>/<version>/source.json`
+/// naming it by `file://` URL, with its integrity. The URL embeds the workspace path, so hashes
+/// generated from two copies of the fixture differ: edit one copy in place instead.
+pub fn publish_local_registry(workspace: &Path) {
+    let registry = workspace.join("registry");
+    for entry in fs::read_dir(registry.join("src")).expect("read registry/src") {
+        let source = entry.expect("registry/src entry").path();
+        let archive_name = source
+            .file_name()
+            .and_then(OsStr::to_str)
+            .expect("module directory name")
+            .to_owned();
+        let (name, version) = archive_name
+            .rsplit_once('-')
+            .expect("registry/src/<name>-<version>");
+        let bytes = zip_directory(&source, &archive_name);
+        let archive = registry.join(format!("{archive_name}.zip"));
+        fs::write(&archive, &bytes).expect("write module archive");
+        let url = url::Url::from_file_path(&archive).expect("absolute archive path");
+        let source_json = serde_json::json!({
+            "integrity": format!("sha256-{}", base64(&Sha256::digest(&bytes))),
+            "strip_prefix": archive_name,
+            "url": url.as_str(),
+        });
+        let module_version = registry.join("modules").join(name).join(version);
+        fs::create_dir_all(&module_version).expect("create module version directory");
+        fs::write(
+            module_version.join("source.json"),
+            serde_json::to_string_pretty(&source_json).expect("serialize source.json"),
+        )
+        .expect("write source.json");
+    }
+}
+
+/// Stored (uncompressed) zip of every file under `source`, each entry prefixed with `prefix/`.
+fn zip_directory(source: &Path, prefix: &str) -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(io::Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    let mut files = walkdir::WalkDir::new(source)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .map(walkdir::DirEntry::into_path)
+        .collect::<Vec<_>>();
+    files.sort();
+    for file in files {
+        let relative = file.strip_prefix(source).expect("under source");
+        let entry = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        writer
+            .start_file(format!("{prefix}/{entry}"), options)
+            .expect("start zip entry");
+        writer
+            .write_all(&fs::read(&file).expect("read module file"))
+            .expect("write zip entry");
+    }
+    writer.finish().expect("finish zip").into_inner()
+}
+
+/// Standard base64 with padding, as Subresource Integrity strings use it.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let mut word = 0u32;
+        for (index, byte) in chunk.iter().enumerate() {
+            word |= u32::from(*byte) << (16 - 8 * index);
+        }
+        for index in 0..4 {
+            if index <= chunk.len() {
+                encoded.push(ALPHABET[((word >> (18 - 6 * index)) & 63) as usize] as char);
+            } else {
+                encoded.push('=');
+            }
+        }
+    }
+    encoded
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> io::Result<()> {

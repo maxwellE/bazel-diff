@@ -1,0 +1,15 @@
+module(
+    name = "single_version_override_patch_test",
+    version = "0.0.0",
+)
+
+# Reproducer for https://github.com/Tinder/bazel-diff/issues/522: the root
+# module patches a registry module. Editing the patch file changes what
+# @patched_dep//:greeting.txt contains, so //:consumer must be impacted even
+# though no .bzl file and no main-repository BUILD file changed.
+bazel_dep(name = "patched_dep", version = "1.0.0")
+single_version_override(
+    module_name = "patched_dep",
+    patch_strip = 1,
+    patches = ["//patches:greeting.patch"],
+)

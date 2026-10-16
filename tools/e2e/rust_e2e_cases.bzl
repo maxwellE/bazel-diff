@@ -164,6 +164,14 @@ RUST_E2E_SUITES = [
                 "timeout": "moderate",
             },
             {
+                "name": "regressions::single_version_override_patch_edit_impacts_consumer",
+                "timeout": "moderate",
+            },
+            {
+                "name": "regressions::single_version_override_patch_edit_impacts_consumer_with_cquery",
+                "timeout": "moderate",
+            },
+            {
                 "name": "regressions::undeclared_workspace_read_is_not_impacted_without_opt_in",
                 "timeout": "moderate",
             },

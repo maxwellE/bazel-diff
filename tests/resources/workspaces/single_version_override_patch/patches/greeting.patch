@@ -1,0 +1,5 @@
+--- a/greeting.txt
++++ b/greeting.txt
+@@ -1 +1 @@
+-hello from upstream
++hello from patch v1

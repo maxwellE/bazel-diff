@@ -381,3 +381,62 @@ fn cquery_keeps_dependencies_of_every_configured_instance() {
         "//:app should be impacted through //:helper, got {impacted:?}"
     );
 }
+
+/// Regression for <https://github.com/Tinder/bazel-diff/issues/522>: the root module applies
+/// `single_version_override(patches = [...])` to a registry module, and the patch rewrites a
+/// plain data file, not a `.bzl` file, that `//:consumer` reads. Editing the patch changes what
+/// Bazel fetches for `@patched_dep`, so `//:consumer` must be impacted; `//:control`, which does
+/// not depend on the module, must not.
+///
+/// The registry archive is named by an absolute `file://` URL (see `publish_local_registry`), so
+/// both hash files come from one checkout edited in place, as in a real CI run, rather than from
+/// two copies of the fixture.
+fn single_version_override_patch_edit(generate_args: &[&str]) -> BTreeSet<String> {
+    let workspace = copy_workspace("single_version_override_patch");
+    publish_local_registry(workspace.path());
+    let output = tempfile::tempdir().unwrap();
+    let from = output.path().join("from.json");
+    let to = output.path().join("to.json");
+    let result = output.path().join("impacted.txt");
+    assert!(generate(workspace.path(), &from, generate_args)
+        .status
+        .success());
+    edit(&workspace.path().join("patches/greeting.patch"), |text| {
+        text.replace("+hello from patch v1", "+hello from patch v2")
+    });
+    assert!(generate(workspace.path(), &to, generate_args)
+        .status
+        .success());
+    assert!(impacted(workspace.path(), &from, &to, &result, &[])
+        .status
+        .success());
+    read_lines(&result)
+}
+
+fn assert_patch_edit_reaches_consumer(impacted: &BTreeSet<String>) {
+    assert!(
+        impacted.iter().any(|label| label.ends_with("//:consumer")),
+        "//:consumer reads the patched file and should be impacted, got {impacted:?}"
+    );
+    assert!(
+        !impacted.iter().any(|label| label.ends_with("//:control")),
+        "//:control does not depend on @patched_dep, got {impacted:?}"
+    );
+}
+
+#[test]
+fn single_version_override_patch_edit_impacts_consumer() {
+    assert_patch_edit_reaches_consumer(&single_version_override_patch_edit(&[]));
+}
+
+/// The configuration from the issue report. Under cquery the consumer's dependency on the module
+/// is recorded as the canonical `@@patched_dep+//:greeting.txt`, and the patch edit, which does
+/// change the `//external:patched_dep` seed, is not reported against `//:consumer`.
+#[test]
+fn single_version_override_patch_edit_impacts_consumer_with_cquery() {
+    assert_patch_edit_reaches_consumer(&single_version_override_patch_edit(&[
+        "--useCquery",
+        "--cqueryExpression",
+        "deps((//...) except attr(tags,manual,//...))",
+    ]));
+}
