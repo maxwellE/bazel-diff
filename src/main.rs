@@ -381,6 +381,9 @@ struct ServeArgs {
     #[arg(long = "cachePruneInterval", default_value = "1h")]
     cache_prune_interval: String,
 
+    #[arg(long = "cacheMemoryMax", default_value = "512MB")]
+    cache_memory_max: String,
+
     #[arg(long = "s3Bucket", conflicts_with = "nexus_url")]
     s3_bucket: Option<String>,
 
@@ -515,6 +518,7 @@ fn bazel_options(args: &HashingArgs, verbose: bool) -> Result<BazelOptions> {
         exclude_targets_query: args.exclude_targets_query.clone(),
         no_bazelrc: false,
         verbose,
+        cancellation: None,
     })
 }
 
@@ -679,6 +683,7 @@ fn get_bazel_options(args: &GetImpactedTargetsArgs, verbose: bool) -> BazelOptio
         exclude_targets_query: None,
         no_bazelrc: args.no_bazelrc,
         verbose,
+        cancellation: None,
     }
 }
 
@@ -874,6 +879,7 @@ impl ServeArgs {
                 .map(bazel_diff::server::parse_byte_size)
                 .transpose()?,
             cache_prune_interval: bazel_diff::server::parse_duration(&self.cache_prune_interval)?,
+            cache_memory_max: bazel_diff::server::parse_byte_size(&self.cache_memory_max)?,
             remote_cache,
             s3_bucket: self.s3_bucket.clone(),
             s3_prefix: self.s3_prefix.clone(),
@@ -1273,6 +1279,8 @@ mod tests {
             "10gb",
             "--cacheMaxEntries",
             "500",
+            "--cacheMemoryMax",
+            "2gb",
             "--s3Bucket",
             "bucket",
             "--s3Prefix",
@@ -1296,6 +1304,7 @@ mod tests {
         assert_eq!(config.cache_max_size, Some(10 * 1024u64.pow(3)));
         assert_eq!(config.cache_max_entries, Some(500));
         assert_eq!(config.cache_prune_interval, Duration::from_secs(3600));
+        assert_eq!(config.cache_memory_max, 2 * 1024u64.pow(3));
         assert_eq!(
             config.remote_cache.as_deref(),
             Some("s3://bucket/team/repo/")

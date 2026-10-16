@@ -302,7 +302,11 @@ curl 'http://localhost:8080/dependency_edges?from=main&to=my-feature-branch'
   identity, liveness, and cache size usage without scraping logs. Unlike the query endpoints it is
   never gated on readiness, so it still responds on an un-ready or lame-ducked instance (the `ready`
   field reports the current state). The `cache` size fields are populated for the local-disk backend
-  and are `null` for a backend whose size is not cheaply knowable in-process.
+  and are `null` for a backend whose size is not cheaply knowable in-process. `activeQueries` counts
+  the queries accepted and not yet finished (queued, running, or abandoned by a client that stopped
+  waiting), and `workspaceBusy` is `true` while any operation holds `--workspacePath` (a query's
+  checkout and `bazel query`, or a startup warmup). A tool that shares the checkout with the server
+  should wait for `workspaceBusy` to be `false` before touching it.
 
 ```bash
 curl 'http://localhost:8080/metrics'
@@ -313,9 +317,11 @@ curl 'http://localhost:8080/metrics'
   "version": "31.4.0",
   "uptimeSeconds": 3600,
   "ready": true,
+  "activeQueries": 1,
+  "workspaceBusy": true,
   "gitEngine": "subprocess",
   "trackDeps": false,
-  "cache": {"directory": "/var/cache/bazel-diff", "remote": "s3://my-bucket/bazel-diff/", "entries": 128, "sizeBytes": 4823913, "sizeHuman": "4.6 MB"},
+  "cache": {"directory": "/var/cache/bazel-diff", "remote": "s3://my-bucket/bazel-diff/", "entries": 128, "sizeBytes": 4823913, "sizeHuman": "4.6 MB", "memory": {"entries": 2, "sizeBytes": 75374, "maxBytes": 536870912}},
   "jvm": {"usedBytes": 123456789, "maxBytes": 2147483648}
 }
 ```
@@ -337,7 +343,10 @@ bazel-diff serve \
 
 With `--s3Bucket` set the cache becomes two-tiered: reads check local disk first and fall back to
 the bucket (backfilling local disk on a hit), and every generated entry is published to both, so
-any replica can serve a revision another replica already hashed. Credentials and region resolve
+any replica can serve a revision another replica already hashed. Entries are published
+gzip-compressed as `<key>.json.gz`, 2-3x smaller than the JSON a replica keeps on local disk; a
+read tries the compressed object first and falls back to the plain `<key>.json` an older release
+wrote, so a mixed fleet keeps sharing entries during an upgrade. Credentials and region resolve
 through the standard AWS default provider chains (environment variables, profile, IRSA web
 identity on EKS, IMDS), or pin the region with `--s3Region`. `--s3Endpoint` plus
 `--s3ForcePathStyle` point the client at an S3-compatible store (MinIO, LocalStack) for local
@@ -369,8 +378,9 @@ bazel-diff serve \
   --nexusUsername bazel-diff-svc
 ```
 
-Entries live at `<nexusUrl>/repository/<nexusRepository>/<nexusPrefix>/<key>.json` and are read
-and written with plain `GET`/`PUT` against Nexus's raw content API. Include any context path Nexus
+Entries live at `<nexusUrl>/repository/<nexusRepository>/<nexusPrefix>/<key>.json.gz`
+(gzip-compressed, with a fallback read of the plain `<key>.json` an older release wrote) and are
+read and written with plain `GET`/`PUT` against Nexus's raw content API. Include any context path Nexus
 is served under in `--nexusUrl` (e.g. `https://example.com/nexus`).
 
 * **Repository setup.** Create a *raw (hosted)* repository and set its *Deployment policy* to
@@ -414,6 +424,16 @@ Notes and operational guidance:
 * The service checks out revisions inside `--workspacePath`, so point it at a dedicated clone, not a
   working tree you edit. All workspace-mutating work (git checkout + `bazel query`) is serialized,
   so a single instance answers one cold query at a time; the per-SHA cache absorbs the rest.
+* `--requestTimeout <seconds>` (default `0`, no limit) bounds how long a query may run. A query that
+  exceeds it is cancelled, not merely abandoned: its `git` and `bazel` subprocesses are killed, the
+  hashes it had not finished generating are not written to the local or shared cache, and the `504`
+  is sent only after the query has released the workspace. The `504` body reports `cancelled`
+  (`true` once the query has stopped; `false` only if it was still winding down a minute later, in
+  which case `/metrics` `activeQueries` reports when it is done) and `workspaceBusy` (whether
+  another operation holds the workspace at that moment). A client that enforces its own deadline
+  instead cannot cancel the server-side work: it keeps running to completion, so poll `/metrics` for
+  `workspaceBusy` before reusing the checkout, or prefer `--requestTimeout`. A killed `git checkout`
+  can leave the clone mid-switch; the next query repairs it with `git checkout --force`.
 * Git operations (fetch and checkout) shell out to the `git` binary at `--gitPath` (default `git`
   on the `PATH`), so a `git` binary must be available on the host. The working tree is checked out
   on disk for `bazel query` to read. Because native git performs every fetch, all clone shapes are
@@ -429,6 +449,11 @@ Notes and operational guidance:
   cache is never pruned (the previous behavior). The `--cacheMax*` flags always bound the local-disk
   tier only; the shared S3 or Nexus tier (see above) manages its own retention via a bucket
   lifecycle policy or a Nexus cleanup policy.
+* Parsed entries are also kept in memory, least recently used out first, within `--cacheMemoryMax`
+  (default `512MB`; `0` disables the tier). Nearly every request shares its `from` revision with
+  the previous one, and reading and parsing a large entry costs seconds, so a repeated revision
+  skips the disk read and the JSON parse entirely. The budget counts each entry's serialized size,
+  a proxy for its heap footprint, and `/metrics` reports the tier under `cache.memory`.
 * Query-affecting flags (`--useCquery`, `--fineGrainedHashExternalRepos`, etc.) mirror
   `generate-hashes`, and are folded into the cache key so a server started with different flags never
   serves another configuration's cached hashes.
@@ -681,6 +706,8 @@ Options:
 
       --cachePruneInterval <CACHE_PRUNE_INTERVAL>
           [default: 1h]
+      --cacheMemoryMax <CACHE_MEMORY_MAX>
+          [default: 512MB]
       --s3Bucket <S3_BUCKET>
 
       --s3Prefix <S3_PREFIX>
