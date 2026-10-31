@@ -9,6 +9,7 @@ pub mod cache;
 pub mod cancel;
 pub mod explain;
 pub mod fingerprint;
+pub mod gcs;
 pub mod git;
 pub mod hash;
 pub mod model;

@@ -447,7 +447,7 @@ struct ServeArgs {
     #[arg(long = "cacheMemoryMax", default_value = "512MB")]
     cache_memory_max: String,
 
-    #[arg(long = "s3Bucket", conflicts_with = "nexus_url")]
+    #[arg(long = "s3Bucket", conflicts_with_all = ["nexus_url", "gcs_bucket"])]
     s3_bucket: Option<String>,
 
     #[arg(long = "s3Prefix", default_value = "")]
@@ -461,6 +461,18 @@ struct ServeArgs {
 
     #[arg(long = "s3ForcePathStyle")]
     s3_force_path_style: bool,
+
+    /// Google Cloud Storage bucket used as the shared cache tier
+    #[arg(long = "gcsBucket", conflicts_with_all = ["s3_bucket", "nexus_url"])]
+    gcs_bucket: Option<String>,
+
+    /// Object name prefix for cache entries in --gcsBucket
+    #[arg(long = "gcsPrefix", default_value = "", requires = "gcs_bucket")]
+    gcs_prefix: String,
+
+    /// GCS JSON API endpoint to use instead of https://storage.googleapis.com, e.g. a local emulator
+    #[arg(long = "gcsEndpoint", requires = "gcs_bucket")]
+    gcs_endpoint: Option<String>,
 
     /// Base URL of a Sonatype Nexus Repository instance used as the shared cache tier
     #[arg(long = "nexusUrl", requires = "nexus_repository")]
@@ -1040,6 +1052,14 @@ impl ServeArgs {
         if self.s3_bucket.is_some() && self.s3_endpoint.as_deref().is_some_and(str::is_empty) {
             bail!("--s3Endpoint must not be empty");
         }
+        if let Some(bucket) = &self.gcs_bucket {
+            if bucket.is_empty() || bucket.contains('/') {
+                bail!("--gcsBucket must be a bucket name, not a path: {bucket:?}");
+            }
+            if self.gcs_endpoint.as_deref().is_some_and(str::is_empty) {
+                bail!("--gcsEndpoint must not be empty");
+            }
+        }
         let nexus_credentials = match (&self.nexus_username, nexus_password) {
             _ if self.nexus_url.is_none() => None,
             (Some(username), Some(password)) => Some(bazel_diff::server::NexusCredentials {
@@ -1050,20 +1070,26 @@ impl ServeArgs {
             (Some(_), None) => bail!("--nexusUsername requires {NEXUS_PASSWORD_ENV} to be set"),
             (None, Some(_)) => bail!("{NEXUS_PASSWORD_ENV} requires --nexusUsername"),
         };
-        let remote_cache = match (&self.s3_bucket, &self.nexus_url, &self.nexus_repository) {
-            (Some(bucket), _, _) => {
-                let prefix = self.s3_prefix.trim_matches('/');
-                Some(if prefix.is_empty() {
-                    format!("s3://{bucket}/")
-                } else {
-                    format!("s3://{bucket}/{prefix}/")
-                })
+        // The shared tier's location as `/metrics` reports it.
+        let bucket_location = |scheme: &str, bucket: &str, prefix: &str| {
+            let prefix = prefix.trim_matches('/');
+            if prefix.is_empty() {
+                format!("{scheme}://{bucket}/")
+            } else {
+                format!("{scheme}://{bucket}/{prefix}/")
             }
-            (None, Some(url), Some(repository)) => Some(
+        };
+        let remote_cache = if let Some(bucket) = &self.s3_bucket {
+            Some(bucket_location("s3", bucket, &self.s3_prefix))
+        } else if let Some(bucket) = &self.gcs_bucket {
+            Some(bucket_location("gs", bucket, &self.gcs_prefix))
+        } else if let (Some(url), Some(repository)) = (&self.nexus_url, &self.nexus_repository) {
+            Some(
                 bazel_diff::server::nexus_base_url(url, repository, &self.nexus_prefix)?
                     .to_string(),
-            ),
-            _ => None,
+            )
+        } else {
+            None
         };
         let config = bazel_diff::server::ServerConfig {
             hash_options: hash_options(&self.hashing, None, None, self.track_deps, verbose)?,
@@ -1100,6 +1126,9 @@ impl ServeArgs {
             s3_region: self.s3_region.clone(),
             s3_endpoint: self.s3_endpoint.clone(),
             s3_force_path_style: self.s3_force_path_style,
+            gcs_bucket: self.gcs_bucket.clone(),
+            gcs_prefix: self.gcs_prefix.clone(),
+            gcs_endpoint: self.gcs_endpoint.clone(),
             nexus_url: self.nexus_url.clone(),
             nexus_repository: self.nexus_repository.clone(),
             nexus_prefix: self.nexus_prefix.clone(),
@@ -1535,6 +1564,108 @@ mod tests {
         assert_eq!(config.warmup_revisions, ["main", "release"]);
         assert!(config.s3_force_path_style);
         assert!(config.hash_options.bazel.verbose);
+    }
+
+    #[test]
+    fn serve_config_parses_gcs_flags() {
+        let serve_args = |extra: &[&str]| {
+            let mut argv = vec![
+                "bazel-diff",
+                "serve",
+                "--workspacePath",
+                "/tmp/ws",
+                "--cacheDir",
+                "/tmp/cache",
+            ];
+            argv.extend(extra);
+            let Commands::Serve(args) = parse(&argv).command else {
+                panic!("expected serve");
+            };
+            args
+        };
+        for (extra, expected) in [
+            (vec!["--gcsBucket", "cache-bucket"], "gs://cache-bucket/"),
+            (
+                vec!["--gcsBucket", "cache-bucket", "--gcsPrefix", "/team/repo/"],
+                "gs://cache-bucket/team/repo/",
+            ),
+        ] {
+            let config = serve_args(&extra).to_config(false).unwrap();
+            assert_eq!(config.remote_cache.as_deref(), Some(expected));
+            assert_eq!(config.gcs_bucket.as_deref(), Some("cache-bucket"));
+            assert!(config.gcs_endpoint.is_none());
+            assert!(config.s3_bucket.is_none());
+            assert!(config.nexus_url.is_none());
+        }
+        let config = serve_args(&[
+            "--gcsBucket",
+            "cache-bucket",
+            "--gcsEndpoint",
+            "http://localhost:4443",
+        ])
+        .to_config(false)
+        .unwrap();
+        assert_eq!(
+            config.gcs_endpoint.as_deref(),
+            Some("http://localhost:4443")
+        );
+        assert_eq!(config.gcs_prefix, "");
+
+        for invalid in [
+            vec!["--gcsBucket", ""],
+            vec!["--gcsBucket", "bucket/path"],
+            vec!["--gcsBucket", "cache-bucket", "--gcsEndpoint", ""],
+        ] {
+            assert!(
+                serve_args(&invalid).to_config(false).is_err(),
+                "{invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn serve_gcs_flags_require_a_bucket_and_exclude_other_shared_tiers() {
+        let argv = |extra: &[&str]| {
+            [
+                "bazel-diff",
+                "serve",
+                "--workspacePath",
+                "/tmp/ws",
+                "--cacheDir",
+                "/tmp/cache",
+            ]
+            .iter()
+            .chain(extra)
+            .map(|argument| (*argument).to_owned())
+            .collect::<Vec<String>>()
+        };
+        for dependent in [
+            vec!["--gcsPrefix", "team/repo"],
+            vec!["--gcsEndpoint", "http://localhost:4443"],
+        ] {
+            assert_eq!(
+                Cli::try_parse_from(argv(&dependent)).unwrap_err().kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{dependent:?}"
+            );
+        }
+        for other in [
+            vec!["--s3Bucket", "s3-bucket"],
+            vec![
+                "--nexusUrl",
+                "https://nexus.example.com",
+                "--nexusRepository",
+                "cache",
+            ],
+        ] {
+            let mut conflicting = vec!["--gcsBucket", "gcs-bucket"];
+            conflicting.extend(&other);
+            assert_eq!(
+                Cli::try_parse_from(argv(&conflicting)).unwrap_err().kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{other:?}"
+            );
+        }
     }
 
     #[test]

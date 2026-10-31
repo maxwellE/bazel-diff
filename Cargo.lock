@@ -144,6 +144,7 @@ version = "39.0.0"
 dependencies = [
  "anyhow",
  "attohttpc",
+ "base64",
  "buffa",
  "buffa-build",
  "clap",
@@ -152,6 +153,7 @@ dependencies = [
  "mimalloc",
  "protoc-bin-vendored",
  "rayon",
+ "ring",
  "rust-s3",
  "rustls-pki-types",
  "serde",

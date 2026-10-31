@@ -412,13 +412,48 @@ revision are also harmless — entries are deterministic per key, so last-write-
 content. The `--cacheMax*` pruning flags bound the *local* tier only; bound the bucket with an S3
 lifecycle policy instead.
 
+### Shared Google Cloud Storage cache
+
+On Google Cloud, a GCS bucket can serve as the shared tier instead of S3. It behaves exactly like
+the S3 tier above — local disk first, the bucket on a local miss (backfilling disk on a hit), every
+generated entry published to both as gzip-compressed `<gcsPrefix>/<key>.json.gz` with a fallback
+read of the plain `<key>.json`, and every GCS failure degraded to a miss or a local-only write —
+and the shared tiers are mutually exclusive.
+
+```bash
+bazel-diff serve \
+  --workspacePath /path/to/workspace-clone \
+  --cacheDir /var/cache/bazel-diff \
+  --gcsBucket my-hash-cache-bucket \
+  --gcsPrefix bazel-diff/my-repo
+```
+
+* **Credentials** resolve the way Google's own clients resolve Application Default Credentials:
+  the JSON file named by `GOOGLE_APPLICATION_CREDENTIALS` (a service account key, or the file
+  `gcloud auth application-default login` writes), then gcloud's well-known copy of that file,
+  then the metadata server of the Google Cloud host (Compute Engine, GKE Workload Identity, Cloud
+  Run). The service fetches a first token at startup and refuses to start without one, so a
+  misconfigured deployment fails fast instead of logging a warning per request. Workload identity
+  federation (`external_account`) files are not supported; use Workload Identity on GKE or a
+  service account key.
+* **Permissions.** The account needs `storage.objects.get` and `storage.objects.create` on the
+  bucket (`roles/storage.objectViewer` plus `roles/storage.objectCreator`). Entries are uploaded
+  with `ifGenerationMatch=0`, so a replica that loses the race on a revision gets a `412` that
+  counts as success, and no overwrite or delete permission is needed.
+* **Redirects are not followed**, so the bearer token is never replayed to another host.
+* **Retention.** As with S3, `--cacheMax*` bounds the local tier only; bound the bucket with an
+  Object Lifecycle Management rule.
+* **Local testing.** `--gcsEndpoint` points the client at a GCS emulator such as
+  [fake-gcs-server](https://github.com/fsouza/fake-gcs-server); credentials still resolve as
+  above (an emulator ignores the token).
+
 ### Shared Sonatype Nexus cache
 
 If your organization already runs [Sonatype Nexus Repository](https://www.sonatype.com/products/sonatype-nexus-repository),
-a *raw (hosted)* repository can serve as the shared tier instead of S3. It behaves exactly like
+a *raw (hosted)* repository can serve as the shared tier instead of a bucket. It behaves exactly like
 the S3 tier above — local disk first, Nexus on a local miss (backfilling disk on a hit), every
 generated entry published to both, and every Nexus failure degraded to a miss or a local-only
-write — and the two are mutually exclusive.
+write — and the shared tiers are mutually exclusive.
 
 ```bash
 export BAZEL_DIFF_NEXUS_PASSWORD=...   # password, or a Nexus user token's pass code
