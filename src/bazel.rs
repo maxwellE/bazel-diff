@@ -408,19 +408,20 @@ impl BazelOptions {
         &self,
         mut transform: impl FnMut(&mut [Target], Option<RepositoryInputs>),
     ) -> Result<QueriedTargets> {
-        self.query_all_targets_encoded(false, |batch, _, inputs| transform(batch, inputs))
+        self.query_all_targets_encoded(None, |batch, _, inputs| transform(batch, inputs))
     }
 
     /// [`Self::query_all_targets_with`], with ordinary query results decoded by
     /// [`decode_lean_target`] when `lean` is set: every rule outside `//external` reaches
     /// `transform` with only its `tags`, `visibility` and `toolchain` attributes decoded, alongside
-    /// the bytes it was decoded from (see [`EncodedTargets`]). Targets decoded in full (repository
-    /// rules) come with empty bytes, and batches that were not decoded lean (cquery, Bzlmod
-    /// repositories, an isolated dependency root's strict query) with an empty slice.
+    /// its rule definition digest, computed with `lean`'s ignored attributes from the attributes
+    /// left encoded (see [`RuleDigests`]). Targets decoded in full (repository rules) come with
+    /// `None`, and batches that were not decoded lean (cquery, Bzlmod repositories, an isolated
+    /// dependency root's strict query) with an empty slice.
     pub(crate) fn query_all_targets_encoded(
         &self,
-        lean: bool,
-        transform: impl FnMut(&mut [Target], &EncodedTargets<'_>, Option<RepositoryInputs>),
+        lean: LeanDecode<'_>,
+        transform: impl FnMut(&mut [Target], &RuleDigests, Option<RepositoryInputs>),
     ) -> Result<QueriedTargets> {
         if self.cquery_root_expression.is_some() {
             if !self.use_cquery {
@@ -455,14 +456,14 @@ impl BazelOptions {
             ..self.clone()
         }
         // Verification is a cquery; nothing it decodes is lean.
-        .query_all_targets_inner(|batch, _, inputs| transform(batch, inputs), true, false)
+        .query_all_targets_inner(|batch, _, inputs| transform(batch, inputs), true, None)
     }
 
     fn query_all_targets_inner(
         &self,
-        mut transform: impl FnMut(&mut [Target], &EncodedTargets<'_>, Option<RepositoryInputs>),
+        mut transform: impl FnMut(&mut [Target], &RuleDigests, Option<RepositoryInputs>),
         verify: bool,
-        lean: bool,
+        lean: LeanDecode<'_>,
     ) -> Result<QueriedTargets> {
         if let Some(root) = &self.isolated_dependency_root {
             if self.use_cquery {
@@ -562,7 +563,7 @@ impl BazelOptions {
                             &self.with_exclude_filter(scope.expression(expression)),
                             false,
                             version,
-                            false,
+                            None,
                             &mut |batch, _| {
                                 scope.record_build_loads(batch, &mut loads);
                                 transform(batch, &[], None);
@@ -572,14 +573,14 @@ impl BazelOptions {
                         // Keep positive distances on the caller's normal view. The full typed
                         // view below qualifies coverage without adding positive impact paths.
                         let targets =
-                            self.query_with(expression, true, version, false, &mut |batch, _| {
+                            self.query_with(expression, true, version, None, &mut |batch, _| {
                                 transform(batch, &[], None)
                             })?;
                         let graph = self.query_with_capture(
                             expression,
                             true,
                             version,
-                            false,
+                            None,
                             &mut |_, _| {},
                             CqueryCapture::Verification,
                             |_| true,
@@ -636,7 +637,7 @@ impl BazelOptions {
             if !additions.is_empty() {
                 let query = self.with_exclude_filter(additions.join(" + "));
                 let mut extra =
-                    strict.query_with(&query, false, version, false, &mut |batch, _| {
+                    strict.query_with(&query, false, version, None, &mut |batch, _| {
                         scope.record_build_loads(batch, &mut loads);
                     })?;
                 retain_supplemental_targets(&mut extra, &targets);
@@ -851,7 +852,7 @@ impl BazelOptions {
                 &expression,
                 false,
                 Some(version),
-                false,
+                None,
                 &mut |batch, _| transform(batch, None),
                 |row| {
                     // A dependency can lead back to an alias in the primary query. Keep its
@@ -939,7 +940,7 @@ impl BazelOptions {
                     &self.with_exclude_filter(expression),
                     false,
                     Some(version),
-                    false,
+                    None,
                     &mut |_, _| {},
                 )?;
                 let mut inventory: BTreeMap<_, _> = records
@@ -985,7 +986,7 @@ impl BazelOptions {
             &self.with_exclude_filter(query_set(&names)?),
             false,
             Some(version),
-            false,
+            None,
             &mut |_, _| {},
         )?;
         let mut alias_attrs = HashMap::new();
@@ -1067,7 +1068,7 @@ impl BazelOptions {
             &self.with_exclude_filter(query_set(aliases)?),
             false,
             Some(version),
-            false,
+            None,
             &mut |_, _| {},
         )?;
         Ok(records
@@ -2020,7 +2021,7 @@ impl BazelOptions {
             }
             let names = query_labels(labels.iter())?;
             let expression = self.with_exclude_filter(names);
-            metadata.query_with(&expression, false, version, false, &mut |_, _| {})
+            metadata.query_with(&expression, false, version, None, &mut |_, _| {})
         };
         for row in read(&names)? {
             let Some(rule) = row.rule.into_option() else {
@@ -2186,7 +2187,7 @@ impl BazelOptions {
     }
 
     pub fn query(&self, expression: &str, use_cquery: bool) -> Result<Vec<Target>> {
-        self.query_with(expression, use_cquery, None, false, &mut |_, _| {})
+        self.query_with(expression, use_cquery, None, None, &mut |_, _| {})
     }
 
     fn query_with(
@@ -2194,8 +2195,8 @@ impl BazelOptions {
         expression: &str,
         use_cquery: bool,
         version: Option<BazelVersion>,
-        lean: bool,
-        transform: &mut impl FnMut(&mut [Target], &EncodedTargets<'_>),
+        lean: LeanDecode<'_>,
+        transform: &mut impl FnMut(&mut [Target], &RuleDigests),
     ) -> Result<Vec<Target>> {
         self.query_with_filtered(expression, use_cquery, version, lean, transform, |_| true)
     }
@@ -2205,8 +2206,8 @@ impl BazelOptions {
         expression: &str,
         use_cquery: bool,
         version: Option<BazelVersion>,
-        lean: bool,
-        transform: &mut impl FnMut(&mut [Target], &EncodedTargets<'_>),
+        lean: LeanDecode<'_>,
+        transform: &mut impl FnMut(&mut [Target], &RuleDigests),
         retain: impl FnMut(&Target) -> bool,
     ) -> Result<Vec<Target>> {
         let graph = self.query_with_capture(
@@ -2236,7 +2237,7 @@ impl BazelOptions {
             &query,
             true,
             Some(version),
-            false,
+            None,
             &mut |_, _| {},
             CqueryCapture::Roots(&mut resolved),
             |_| true,
@@ -2284,8 +2285,8 @@ impl BazelOptions {
         expression: &str,
         use_cquery: bool,
         version: Option<BazelVersion>,
-        lean: bool,
-        transform: &mut impl FnMut(&mut [Target], &EncodedTargets<'_>),
+        lean: LeanDecode<'_>,
+        transform: &mut impl FnMut(&mut [Target], &RuleDigests),
         capture: CqueryCapture<'_>,
         retain: impl FnMut(&Target) -> bool,
     ) -> Result<QueryGraph> {
@@ -3834,25 +3835,35 @@ impl<'a> Iterator for ProtoFields<'a> {
     }
 }
 
-/// The encoded messages of a batch's lean-decoded targets, one entry per target of the batch
-/// handed to the transform: the bytes [`decode_lean_target`] decoded the target from, or empty
-/// when it was decoded in full. The whole slice is empty when the stream is not decoded lean.
-/// [`encoded_rule_attributes`] reads the attributes the decoded target lacks back out of them.
-pub(crate) type EncodedTargets<'a> = [&'a [u8]];
+/// Whether ordinary query results are decoded by [`decode_lean_target`]: when they are, the
+/// attributes left out of the rule definition digests computed along the way (hashing's
+/// ignored rule attributes; see [`RuleDigests`]).
+pub(crate) type LeanDecode<'a> = Option<&'a HashSet<String>>;
+
+/// The rule definition digests of a batch's lean-decoded targets, one entry per target of the
+/// batch handed to the transform: the digest of the target's rule
+/// ([`crate::hash::rule_definition_digest_encoded`]), computed by the thread that decoded it from
+/// the attributes it left encoded, or `None` when it was decoded in full or is not a rule. The
+/// whole slice is empty when the stream is not decoded lean.
+///
+/// The decoder finds the attributes it leaves out while it splits the rule, so hashing them there
+/// is the only walk over the message, done while its bytes are hot; and the batch holds a digest
+/// per target through the transform rather than the attributes.
+pub(crate) type RuleDigests = [Option<[u8; 32]>];
 
 #[cfg(test)]
 fn decode_target_stream(
     path: &Path,
-    lean: bool,
-    transform: &mut impl FnMut(&mut [Target], &EncodedTargets<'_>),
+    lean: LeanDecode<'_>,
+    transform: &mut impl FnMut(&mut [Target], &RuleDigests),
 ) -> Result<Vec<Target>> {
     decode_target_stream_filtered(path, lean, transform, |_| true)
 }
 
 fn decode_target_stream_filtered(
     path: &Path,
-    lean: bool,
-    transform: &mut impl FnMut(&mut [Target], &EncodedTargets<'_>),
+    lean: LeanDecode<'_>,
+    transform: &mut impl FnMut(&mut [Target], &RuleDigests),
     mut retain: impl FnMut(&Target) -> bool,
 ) -> Result<Vec<Target>> {
     let mut reader = BufReader::with_capacity(1 << 20, File::open(path)?);
@@ -3862,22 +3873,33 @@ fn decode_target_stream_filtered(
     while read_raw_batch(&mut reader, &mut batch)? {
         let start = targets.len();
         let mut encoded = Vec::new();
-        if lean {
+        if let Some(ignored) = lean {
             let mut lowered = Vec::new();
             batch
                 .slices()
-                .map_init(LeanScratch::default, |scratch, bytes| {
-                    decode_lean_target(bytes, scratch).map(|(target, lean)| {
-                        (lower_query_target(target), if lean { bytes } else { &[] })
-                    })
-                })
+                .map_init(
+                    || (LeanScratch::default(), Vec::new()),
+                    |(scratch, left_out), bytes| {
+                        left_out.clear();
+                        let (target, lean) = decode_lean_target(bytes, scratch, left_out)?;
+                        let target = lower_query_target(target);
+                        let digest = target
+                            .as_ref()
+                            .and_then(|target| target.rule.as_option())
+                            .filter(|_| lean)
+                            .map(|rule| {
+                                crate::hash::rule_definition_digest_encoded(rule, left_out, ignored)
+                            });
+                        anyhow::Ok((target, digest))
+                    },
+                )
                 .collect_into_vec(&mut lowered);
             targets.reserve(lowered.len());
             for result in lowered {
-                let (target, bytes) = result?;
+                let (target, digest) = result?;
                 if let Some(target) = target.filter(&mut retain) {
                     targets.push(target);
-                    encoded.push(bytes);
+                    encoded.push(digest);
                 }
             }
         } else {
@@ -4033,19 +4055,32 @@ fn push_wire_varint(out: &mut Vec<u8>, mut value: u64) {
 /// URL, checksum and path attributes. So is anything this wire reader does not handle, a target
 /// that repeats its rule field (which protobuf merges), or an attribute that is malformed or whose
 /// name is not UTF-8. `scratch` holds the re-framed message and is reused between calls.
-fn decode_lean_target(bytes: &[u8], scratch: &mut LeanScratch) -> Result<(Target, bool)> {
-    match split_lean_target(bytes, scratch) {
+///
+/// For a target it decodes lean, it appends the attributes it left out to `left_out`, in query
+/// order; otherwise `left_out` is left as it was.
+fn decode_lean_target<'a>(
+    bytes: &'a [u8],
+    scratch: &mut LeanScratch,
+    left_out: &mut Vec<EncodedAttribute<'a>>,
+) -> Result<(Target, bool)> {
+    let first = left_out.len();
+    match split_lean_target(bytes, scratch, left_out) {
         Some(()) => Ok((
             <Target as Message>::decode_from_slice(&scratch.target)?,
             true,
         )),
-        None => Ok((decode_query_target(bytes)?, false)),
+        None => {
+            left_out.truncate(first);
+            Ok((decode_query_target(bytes)?, false))
+        }
     }
 }
 
 /// Appends to `out` the attributes [`decode_lean_target`] left out of the target it decoded lean
-/// from `bytes`, in query order. Only meaningful for such bytes; empty `bytes` add nothing.
-pub(crate) fn encoded_rule_attributes<'a>(bytes: &'a [u8], out: &mut Vec<EncodedAttribute<'a>>) {
+/// from `bytes`, in query order, by reading the message again. Only meaningful for such bytes;
+/// empty `bytes` add nothing. Tests check what the decoder hands back against it.
+#[cfg(test)]
+fn encoded_rule_attributes<'a>(bytes: &'a [u8], out: &mut Vec<EncodedAttribute<'a>>) {
     let Some(rule_bytes) = single_rule_field(bytes) else {
         return;
     };
@@ -4078,6 +4113,7 @@ fn single_rule_field(bytes: &[u8]) -> Option<&[u8]> {
 
 /// The rule's attribute messages with their names, in order. Yields `None` for an attribute
 /// that is malformed or whose name is not UTF-8.
+#[cfg(test)]
 fn rule_attributes(rule_bytes: &[u8]) -> impl Iterator<Item = Option<(&[u8], &str)>> {
     wire_fields(rule_bytes)
         .filter(|field| field.as_ref().is_none_or(|field| field.number == 4))
@@ -4095,19 +4131,32 @@ struct LeanScratch {
     rule: Vec<u8>,
 }
 
-/// Writes `bytes` without its hashed-only rule attributes into `scratch.target`; `None` when the
-/// target must be decoded as is.
-fn split_lean_target(bytes: &[u8], scratch: &mut LeanScratch) -> Option<()> {
+/// Writes `bytes` without its hashed-only rule attributes into `scratch.target`, and appends
+/// those attributes to `left_out` in query order; `None` when the target must be decoded as is
+/// (what it appended is then meaningless).
+fn split_lean_target<'a>(
+    bytes: &'a [u8],
+    scratch: &mut LeanScratch,
+    left_out: &mut Vec<EncodedAttribute<'a>>,
+) -> Option<()> {
     let rule_bytes = single_rule_field(bytes)?;
     let mut rule_name = None;
+    let mut position = 0;
     scratch.rule.clear();
     for field in wire_fields(rule_bytes) {
         let field = field?;
         match field.number {
             1 => rule_name = Some(field.payload?),
             4 => {
-                let name = std::str::from_utf8(last_payload(field.payload?, 1)?).ok()?;
+                let attribute = field.payload?;
+                let name = std::str::from_utf8(last_payload(attribute, 1)?).ok()?;
+                position += 1;
                 if !decoded_in_lean_target(name) {
+                    left_out.push(EncodedAttribute {
+                        position: position - 1,
+                        name,
+                        bytes: attribute,
+                    });
                     continue;
                 }
             }
@@ -5882,7 +5931,7 @@ mod tests {
         let query_path = directory.path().join("query.pb");
         write_delimited(&query_path, &[rule_target("//a:a"), rule_target("//b:b")]);
         let mut seen = Vec::new();
-        let targets = decode_target_stream(&query_path, false, &mut |batch, _| {
+        let targets = decode_target_stream(&query_path, None, &mut |batch, _| {
             seen.extend(
                 batch
                     .iter()
@@ -5969,11 +6018,22 @@ mod tests {
         }
         let bytes = full.encode_to_vec();
 
-        let (lean, decoded_lean) = decode_lean_target(&bytes, &mut LeanScratch::default()).unwrap();
+        // Appends after what is already there.
+        let earlier = EncodedAttribute {
+            position: 9,
+            name: "earlier",
+            bytes: &[],
+        };
+        let mut left_out = vec![earlier];
+        let (lean, decoded_lean) =
+            decode_lean_target(&bytes, &mut LeanScratch::default(), &mut left_out).unwrap();
         let mut encoded = Vec::new();
         encoded_rule_attributes(&bytes, &mut encoded);
 
         assert!(decoded_lean);
+        // What the decoder hands back is what reading the message again finds.
+        assert_eq!(left_out[0], earlier);
+        assert_eq!(left_out[1..], encoded);
         let attributes = &full.rule.as_option().unwrap().attribute;
         assert_eq!(
             encoded,
@@ -6020,9 +6080,11 @@ mod tests {
         }
         for target in [external, source, toolchain] {
             let bytes = target.encode_to_vec();
+            let mut left_out = Vec::new();
             let (lean, decoded_lean) =
-                decode_lean_target(&bytes, &mut LeanScratch::default()).unwrap();
+                decode_lean_target(&bytes, &mut LeanScratch::default(), &mut left_out).unwrap();
             assert_eq!(lean, target);
+            assert!(left_out.is_empty(), "{target:?}");
             // Only the toolchain rule decodes lean, keeping its only attribute decoded.
             assert_eq!(
                 decoded_lean,
@@ -6042,7 +6104,11 @@ mod tests {
         target.rule.as_option_mut().unwrap().attribute = vec![lean_attribute("srcs", "a")];
         let bytes = target.encode_to_vec();
         for end in [bytes.len() - 1, bytes.len() - 5] {
-            assert!(decode_lean_target(&bytes[..end], &mut LeanScratch::default()).is_err());
+            let mut left_out = Vec::new();
+            assert!(
+                decode_lean_target(&bytes[..end], &mut LeanScratch::default(), &mut left_out)
+                    .is_err()
+            );
         }
     }
 
@@ -6053,48 +6119,46 @@ mod tests {
         let mut written = (0..DECODE_BATCH_MESSAGES + 3)
             .map(|index| {
                 let mut target = rule_target(&format!("//pkg:target{index}"));
-                target.rule.as_option_mut().unwrap().attribute =
-                    vec![lean_attribute("srcs", &index.to_string())];
+                target.rule.as_option_mut().unwrap().attribute = vec![
+                    lean_attribute("srcs", &index.to_string()),
+                    lean_attribute("cmd", "echo"),
+                ];
                 target
             })
             .collect::<Vec<_>>();
         written.push(rule_target("//external:repo"));
         write_delimited(&path, &written);
+        let ignored = HashSet::from(["cmd".to_owned()]);
         let mut seen = Vec::new();
-        let decoded = decode_target_stream(&path, true, &mut |batch, encoded| {
-            assert_eq!(batch.len(), encoded.len());
-            for (target, bytes) in batch.iter().zip(encoded) {
-                let mut attributes = Vec::new();
-                encoded_rule_attributes(bytes, &mut attributes);
-                let names = attributes
-                    .iter()
-                    .map(|a| a.name.to_owned())
-                    .collect::<Vec<_>>();
-                seen.push((target_name(target).unwrap().to_owned(), names));
+        let decoded = decode_target_stream(&path, Some(&ignored), &mut |batch, digests| {
+            assert_eq!(batch.len(), digests.len());
+            for (target, digest) in batch.iter().zip(digests) {
+                seen.push((target_name(target).unwrap().to_owned(), *digest));
             }
         })
         .unwrap();
         assert_eq!(decoded.len(), written.len());
-        assert_eq!(seen.len(), written.len());
-        assert_eq!(
-            seen[0],
-            ("//pkg:target0".to_owned(), vec!["srcs".to_owned()])
+        // Each lean rule comes with the digest of its whole definition, ignored attributes left
+        // out; the repository rule, decoded in full, with none.
+        let expected = written
+            .iter()
+            .map(|target| {
+                let rule = target.rule.as_option().unwrap();
+                let digest = (!rule.name.starts_with("//external:"))
+                    .then(|| crate::hash::rule_definition_digest_encoded(rule, &[], &ignored));
+                (rule.name.clone(), digest)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(seen, expected);
+        let first = written[0].rule.as_option().unwrap();
+        assert_ne!(
+            seen[0].1,
+            Some(crate::hash::rule_definition_digest_encoded(
+                first,
+                &[],
+                &HashSet::new()
+            ))
         );
-        assert_eq!(
-            seen.last().unwrap(),
-            &("//external:repo".to_owned(), Vec::<String>::new())
-        );
-        let mut external = Vec::new();
-        decode_target_stream(&path, true, &mut |batch, encoded| {
-            if let Some(index) = batch
-                .iter()
-                .position(|target| target_name(target) == Some("//external:repo"))
-            {
-                external.push(encoded[index].to_vec());
-            }
-        })
-        .unwrap();
-        assert_eq!(external, [Vec::<u8>::new()]);
         assert!(decoded[..DECODE_BATCH_MESSAGES + 3]
             .iter()
             .all(|target| target.rule.as_option().unwrap().attribute.is_empty()));
@@ -6110,7 +6174,7 @@ mod tests {
         write_delimited(&path, &written);
         assert_eq!(decode_delimited::<Target>(&path).unwrap(), written);
         let mut seen = Vec::new();
-        let decoded = decode_target_stream(&path, false, &mut |batch, _| {
+        let decoded = decode_target_stream(&path, None, &mut |batch, _| {
             seen.extend(
                 batch
                     .iter()
@@ -6208,7 +6272,7 @@ mod tests {
         let path = directory.path().join("truncated.pb");
         // A length prefix of 16 followed by only two bytes of payload.
         fs::write(&path, [0x10u8, 0x00, 0x00]).unwrap();
-        assert!(decode_target_stream(&path, false, &mut |_, _| {}).is_err());
+        assert!(decode_target_stream(&path, None, &mut |_, _| {}).is_err());
         assert!(decode_delimited::<Repository>(&path).is_err());
         // One empty repository followed by a complete frame containing an invalid wire tag.
         fs::write(&path, [0x00, 0x01, 0x00]).unwrap();
@@ -9595,7 +9659,7 @@ exit 1
                 "deps(config(//app:lib, target))",
                 true,
                 Some(BazelVersion(8, 7, 0)),
-                false,
+                None,
                 &mut |_, _| {},
                 CqueryCapture::Standard,
                 |_| true,
@@ -9607,7 +9671,7 @@ exit 1
                 "deps(config(//app:lib, target))",
                 true,
                 Some(BazelVersion(8, 7, 0)),
-                false,
+                None,
                 &mut |_, _| {},
                 CqueryCapture::Verification,
                 |_| true,
